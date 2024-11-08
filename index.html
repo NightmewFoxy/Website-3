@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plumber Joes Rating</title>
+    <style>
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            font-family: Arial, sans-serif;
+            background-color: #f8f9fa;
+            margin: 0;
+        }
+        h1 {
+            font-size: 2em;
+            margin: 0.5em;
+        }
+        p {
+            font-size: 1.2em;
+        }
+        .stars {
+            display: flex;
+            gap: 1em;
+        }
+        .star {
+            font-size: 3em;
+            cursor: pointer;
+            color: gold;
+        }
+    </style>
+    <script>
+        function rateUs(rating) {
+            if (rating === 5) {
+                // Redirect to your Google Business review page for 5 stars
+                window.location.href = "https://www.google.com/search?q=Nikk%C5%8D+%E6%97%A5%E5%BC%8F%E5%BF%AB%E9%A4%90%E5%BA%97&rlz=1C1ONGR_enMY1027MY1027&oq=Nikk%C5%8D+%E6%97%A5%E5%BC%8F%E5%BF%AB%E9%A4%90%E5%BA%97&gs_lcrp=EgZjaHJvbWUyEQgAEEUYORhDGOMCGIAEGIoFMhIIARAuGEMYrwEYxwEYgAQYigUyBwgCEAAYgAQyBwgDEAAYgAQyBwgEEAAYgAQyBggFEEUYPDIGCAYQRRg8MgYIBxBFGDzSAQgyMzU1ajBqN6gCALACAA&sourceid=chrome&ie=UTF-8#lrd=0x31cdb3b528d3e233:0x131e3e63e01f6b01,3,,,,"; // Replace with your actual Google Business link
+            } else {
+                // Redirect to feedback form for 1-4 stars
+                window.location.href = "https://yourwebsite.com/feedback"; // Replace with your feedback form link
+            }
+        }
+    </script>
+</head>
+<body>
+    <header>
+        <img src="https://www.facebook.com/photo/?fbid=857410385753064&set=a.638555230971915" alt="Plumber Joes Logo" style="margin-bottom: 1em;">
+        <h1>Nikkō 日式快餐店
+        </h1>
+        <p>Thanks for being our customer</p>
+        <p>How would you rate us?</p>
+    </header>
+    <div class="stars">
+        <span class="star" onclick="rateUs(1)">&#9733;</span>
+        <span class="star" onclick="rateUs(2)">&#9733;</span>
+        <span class="star" onclick="rateUs(3)">&#9733;</span>
+        <span class="star" onclick="rateUs(4)">&#9733;</span>
+        <span class="star" onclick="rateUs(5)">&#9733;</span>
+    </div>
+</body>
+</html>
