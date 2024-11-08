@@ -52,32 +52,36 @@
 
         .stars {
             display: flex;
-            gap: 0.6em;
-            margin-top: 0.5em;
+            gap: 1em;
+            margin-top: 0.8em;
+        }
+
+        .star-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
         }
 
         .star {
-            font-size: 2.5em; /* Adjust font size */
+            font-size: 3em; /* Adjusted font size */
             cursor: pointer;
             color: grey; /* Grey by default */
             transition: color 0.2s ease, transform 0.2s ease;
-            position: relative;
-            width: 1.5em; /* Set width for alignment */
-            text-align: center; /* Center the number */
         }
 
         .star.active {
             color: #f1c40f; /* Gold when active */
         }
 
-        /* Style for the numbers inside stars */
+        /* Style for the numbers above stars */
         .star-number {
-            position: absolute;
-            top: 0;
-            left: 50%;
-            transform: translateX(-50%);
-            font-size: 0.6em;
+            font-size: 0.9em;
             color: #333;
+            margin-bottom: 0.1em;
+        }
+
+        .star:hover {
+            transform: scale(1.1);
         }
     </style>
     <script>
@@ -110,11 +114,26 @@
             <p>How would you rate us?</p>
         </header>
         <div class="stars">
-            <span class="star" onclick="rateUs(1)">&#9733;<span class="star-number">1</span></span>
-            <span class="star" onclick="rateUs(2)">&#9733;<span class="star-number">2</span></span>
-            <span class="star" onclick="rateUs(3)">&#9733;<span class="star-number">3</span></span>
-            <span class="star" onclick="rateUs(4)">&#9733;<span class="star-number">4</span></span>
-            <span class="star" onclick="rateUs(5)">&#9733;<span class="star-number">5</span></span>
+            <div class="star-container">
+                <span class="star-number">1</span>
+                <span class="star" onclick="rateUs(1)">&#9733;</span>
+            </div>
+            <div class="star-container">
+                <span class="star-number">2</span>
+                <span class="star" onclick="rateUs(2)">&#9733;</span>
+            </div>
+            <div class="star-container">
+                <span class="star-number">3</span>
+                <span class="star" onclick="rateUs(3)">&#9733;</span>
+            </div>
+            <div class="star-container">
+                <span class="star-number">4</span>
+                <span class="star" onclick="rateUs(4)">&#9733;</span>
+            </div>
+            <div class="star-container">
+                <span class="star-number">5</span>
+                <span class="star" onclick="rateUs(5)">&#9733;</span>
+            </div>
         </div>
     </div>
 </body>
