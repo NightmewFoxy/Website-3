@@ -52,8 +52,8 @@
 
         .stars {
             display: flex;
-            gap: 1em;
-            margin-top: 0.8em;
+            gap: 1.5em; /* Increased gap for better spacing */
+            margin-top: 1em;
         }
 
         .star-container {
@@ -63,21 +63,21 @@
         }
 
         .star {
-            font-size: 3em; /* Adjusted font size */
+            font-size: 4em; /* Increased font size for stars */
             cursor: pointer;
-            color: grey; /* Grey by default */
+            color: grey; /* Default grey color */
             transition: color 0.2s ease, transform 0.2s ease;
         }
 
         .star.active {
-            color: #f1c40f; /* Gold when active */
+            color: #f1c40f; /* Gold color for active stars */
         }
 
         /* Style for the numbers above stars */
         .star-number {
-            font-size: 0.9em;
+            font-size: 1.2em; /* Increased font size for numbers */
             color: #333;
-            margin-bottom: 0.1em;
+            margin-bottom: 0.2em;
         }
 
         .star:hover {
@@ -86,21 +86,19 @@
     </style>
     <script>
         function rateUs(rating) {
-            // Clear active state on all stars
             const stars = document.querySelectorAll('.star');
             stars.forEach((star, index) => {
                 if (index < rating) {
-                    star.classList.add('active'); // Highlight up to the clicked star
+                    star.classList.add('active');
                 } else {
                     star.classList.remove('active');
                 }
             });
 
-            // Redirect based on rating
             if (rating === 5) {
                 window.location.href = "https://www.google.com/search?q=Nikk%C5%8D+%E6%97%A5%E5%BC%8F%E5%BF%AB%E9%A4%90%E5%BA%97&rlz=1C1ONGR_enMY1027MY1027&oq=Nikk%C5%8D+%E6%97%A5%E5%BC%8F%E5%BF%AB%E9%A4%90%E5%BA%97&gs_lcrp=EgZjaHJvbWUyEQgAEEUYORhDGOMCGIAEGIoFMhIIARAuGEMYrwEYxwEYgAQYigUyBwgCEAAYgAQyBwgDEAAYgAQyBwgEEAAYgAQyBggFEEUYPDIGCAYQRRg8MgYIBxBFGDzSAQgyMzU1ajBqN6gCALACAA&sourceid=chrome&ie=UTF-8#lrd=0x31cdb3b528d3e233:0x131e3e63e01f6b01,3,,,,"; 
             } else {
-                window.location.href = "https://yourwebsite.com/feedback"; // Replace with your feedback form link
+                window.location.href = "https://yourwebsite.com/feedback";
             }
         }
     </script>
