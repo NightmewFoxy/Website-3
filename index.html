@@ -52,23 +52,35 @@
 
         .stars {
             display: flex;
-            gap: 0.6em; /* Reduced gap for a closer look */
+            gap: 0.6em;
             margin-top: 0.5em;
         }
 
         .star {
-            font-size: 3.5em; /* Increased font size */
+            font-size: 3.5em;
             cursor: pointer;
-            color: #f1c40f;
-            transition: transform 0.2s ease;
+            color: grey; /* Grey by default */
+            transition: color 0.2s ease, transform 0.2s ease;
         }
 
-        .star:hover {
-            transform: scale(1.1); /* Slightly reduced scale for subtle effect */
+        .star:hover,
+        .star.active {
+            color: #f1c40f; /* Gold when hovered or active */
+            transform: scale(1.1);
         }
     </style>
     <script>
         function rateUs(rating) {
+            // Clear active state on all stars
+            const stars = document.querySelectorAll('.star');
+            stars.forEach((star, index) => {
+                if (index < rating) {
+                    star.classList.add('active'); // Highlight up to the clicked star
+                } else {
+                    star.classList.remove('active');
+                }
+            });
+
             if (rating === 5) {
                 // Redirect to your Google Business review page for 5 stars
                 window.location.href = "https://www.google.com/search?q=Nikk%C5%8D+%E6%97%A5%E5%BC%8F%E5%BF%AB%E9%A4%90%E5%BA%97&rlz=1C1ONGR_enMY1027MY1027&oq=Nikk%C5%8D+%E6%97%A5%E5%BC%8F%E5%BF%AB%E9%A4%90%E5%BA%97&gs_lcrp=EgZjaHJvbWUyEQgAEEUYORhDGOMCGIAEGIoFMhIIARAuGEMYrwEYxwEYgAQYigUyBwgCEAAYgAQyBwgDEAAYgAQyBwgEEAAYgAQyBggFEEUYPDIGCAYQRRg8MgYIBxBFGDzSAQgyMzU1ajBqN6gCALACAA&sourceid=chrome&ie=UTF-8#lrd=0x31cdb3b528d3e233:0x131e3e63e01f6b01,3,,,,"; // Replace with your actual Google Business link
