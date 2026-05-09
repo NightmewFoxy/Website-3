@@ -44,6 +44,60 @@ STATE_PATH = os.environ.get(
     "/data/state.json" if os.path.isdir("/data") else "state.json",
 )
 
+PARAMS_PATH = os.environ.get(
+    "PARAMS_PATH",
+    "/data/params.json" if os.path.isdir("/data") else "params.json",
+)
+
+DEFAULT_PARAMS: dict = {
+    "adx_threshold": 25,
+    "rsi_lo": 35,
+    "rsi_hi": 65,
+    "volume_mult": 1.2,
+    "sl_mult": 2.0,
+    "tp_mult": 3.0,
+}
+
+params: dict = dict(DEFAULT_PARAMS)
+
+
+def load_params() -> None:
+    if not os.path.exists(PARAMS_PATH):
+        log.info("No saved params at %s; using defaults", PARAMS_PATH)
+        return
+    try:
+        with open(PARAMS_PATH) as f:
+            saved = json.load(f)
+        for k in DEFAULT_PARAMS:
+            if k in saved:
+                params[k] = saved[k]
+        log.info("Loaded params: %s", params)
+    except Exception as e:
+        log.warning("Failed to load params from %s: %s", PARAMS_PATH, e)
+
+
+def save_params() -> None:
+    try:
+        parent = os.path.dirname(PARAMS_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = PARAMS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(params, f)
+        os.replace(tmp, PARAMS_PATH)
+    except Exception as e:
+        log.warning("Failed to save params to %s: %s", PARAMS_PATH, e)
+
+
+def params_text() -> str:
+    return (
+        f"ADX>{params['adx_threshold']}, "
+        f"RSI {params['rsi_lo']}-{params['rsi_hi']}, "
+        f"vol x{params['volume_mult']}, "
+        f"SL {params['sl_mult']}xATR, "
+        f"TP {params['tp_mult']}xATR"
+    )
+
 
 def load_state() -> None:
     if not os.path.exists(STATE_PATH):
@@ -268,7 +322,7 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     hist_growing_up = hist_now > hist_prev
     hist_growing_down = hist_now < hist_prev
 
-    rsi_in_range = 35 <= rsi_now <= 65
+    rsi_in_range = params["rsi_lo"] <= rsi_now <= params["rsi_hi"]
     rsi_long_bounce = rsi_prev < 30 and rsi_now > rsi_prev
     rsi_short_rollover = rsi_prev > 70 and rsi_now < rsi_prev
     rsi_long_ok = rsi_in_range or rsi_long_bounce
@@ -277,8 +331,8 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     obv_bull = obv_now > obv_ema_now
     obv_bear = obv_now < obv_ema_now
 
-    volume_ok = bool(pd.notna(vol_sma_now) and vol_now >= 1.2 * vol_sma_now)
-    adx_ok = bool(pd.notna(adx_now) and adx_now >= 25)
+    volume_ok = bool(pd.notna(vol_sma_now) and vol_now >= params["volume_mult"] * vol_sma_now)
+    adx_ok = bool(pd.notna(adx_now) and adx_now >= params["adx_threshold"])
 
     trend_4h = get_4h_trend(symbol)
 
@@ -332,12 +386,14 @@ def format_message(symbol: str, r: dict) -> str:
     ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S MYT")
     price = r["price"]
     atr_v = r["atr"]
+    tp_mult = params["tp_mult"]
+    sl_mult = params["sl_mult"]
     if r["direction"] == "LONG":
-        tp = price + 3 * atr_v
-        sl = price - 2 * atr_v
+        tp = price + tp_mult * atr_v
+        sl = price - sl_mult * atr_v
     else:
-        tp = price - 3 * atr_v
-        sl = price + 2 * atr_v
+        tp = price - tp_mult * atr_v
+        sl = price + sl_mult * atr_v
     return (
         f"<b>{r['direction']} signal: {symbol}</b>\n"
         f"Timeframe: {TIMEFRAME}\n"
@@ -468,26 +524,65 @@ def handle_check_command(reply_to_message_id: int | None = None) -> None:
     log.info("/check reply sent (%d pairs)", len(rankings))
 
 
-def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tuple[list[dict], dict]:
+def _precompute_bt(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> dict:
     close = df_1h["close"]
     high_arr = df_1h["high"]
     low_arr = df_1h["low"]
     volume = df_1h["volume"]
 
-    ema100_1h = ema(close, 100)
-    rsi14 = rsi(close, 14)
     macd_line, sig_line, hist = macd(close)
     obv_line = obv(close, volume)
-    obv_ema_v = ema(obv_line, 20)
-    atr14 = atr(high_arr, low_arr, close, 14)
-    adx14 = compute_adx(high_arr, low_arr, close, 14)
-    vol_sma20 = volume.rolling(window=20).mean()
 
     ema100_4h_full = ema(df_4h["close"], 100)
     ema100_4h_indexed = pd.Series(ema100_4h_full.values, index=df_4h["close_time"])
     ema100_4h_aligned = ema100_4h_indexed.reindex(df_1h["close_time"], method="ffill").values
 
-    n = len(df_1h)
+    return {
+        "close": close,
+        "high": high_arr,
+        "low": low_arr,
+        "volume": volume,
+        "ema100_1h": ema(close, 100),
+        "rsi14": rsi(close, 14),
+        "macd_line": macd_line,
+        "sig_line": sig_line,
+        "hist": hist,
+        "obv": obv_line,
+        "obv_ema": ema(obv_line, 20),
+        "atr14": atr(high_arr, low_arr, close, 14),
+        "adx14": compute_adx(high_arr, low_arr, close, 14),
+        "vol_sma20": volume.rolling(window=20).mean(),
+        "ema100_4h_aligned": ema100_4h_aligned,
+    }
+
+
+def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
+                           log_entries: bool = False) -> tuple[list[dict], dict]:
+    close = precomp["close"]
+    high_arr = precomp["high"]
+    low_arr = precomp["low"]
+    volume = precomp["volume"]
+    ema100_1h = precomp["ema100_1h"]
+    rsi14 = precomp["rsi14"]
+    macd_line = precomp["macd_line"]
+    sig_line = precomp["sig_line"]
+    hist = precomp["hist"]
+    obv_line = precomp["obv"]
+    obv_ema_v = precomp["obv_ema"]
+    atr14 = precomp["atr14"]
+    adx14 = precomp["adx14"]
+    vol_sma20 = precomp["vol_sma20"]
+    ema100_4h_aligned = precomp["ema100_4h_aligned"]
+
+    rsi_lo = sim_params["rsi_lo"]
+    rsi_hi = sim_params["rsi_hi"]
+    vol_mult = sim_params["volume_mult"]
+    adx_thr = sim_params["adx_threshold"]
+    sl_mult = sim_params["sl_mult"]
+    tp_mult = sim_params["tp_mult"]
+    tp_hit_rr = tp_mult / sl_mult
+
+    n = len(close)
     trades: list[dict] = []
     open_pos: dict | None = None
     debug = {
@@ -521,7 +616,7 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tupl
                 open_pos = None
                 continue
             if tp_hit:
-                trades.append({"direction": d, "entry": entry, "exit": tp, "rr": 1.5, "result": "win"})
+                trades.append({"direction": d, "entry": entry, "exit": tp, "rr": tp_hit_rr, "result": "win"})
                 open_pos = None
                 continue
 
@@ -569,19 +664,19 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tupl
         cross_down = macd_pr >= sig_pr and macd_cur < sig_cur
         hist_growing_up = hist_cur > hist_pr
         hist_growing_down = hist_cur < hist_pr
-        rsi_in_range = 35 <= rsi_cur <= 65
+        rsi_in_range = rsi_lo <= rsi_cur <= rsi_hi
         rsi_long_bounce = rsi_pr < 30 and rsi_cur > rsi_pr
         rsi_short_rollover = rsi_pr > 70 and rsi_cur < rsi_pr
         rsi_long_ok = rsi_in_range or rsi_long_bounce
         rsi_short_ok = rsi_in_range or rsi_short_rollover
         obv_bull = obv_cur > obv_ema_cur
         obv_bear = obv_cur < obv_ema_cur
-        volume_ok = vol_cur >= 1.2 * vol_sma_cur
+        volume_ok = vol_cur >= vol_mult * vol_sma_cur
         ema4h = float(ema100_4h_now)
         trend_up = c > ema4h
         trend_down = c < ema4h
+        adx_ok = adx_cur >= adx_thr
 
-        adx_ok = adx_cur >= 25
         c_long = [c > ema100_now, trend_up, cross_up, hist_growing_up,
                   rsi_long_ok, obv_bull, volume_ok, adx_ok]
         c_short = [c < ema100_now, trend_down, cross_down, hist_growing_down,
@@ -597,33 +692,41 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tupl
             debug["rejected_by_4h_only"] += 1
 
         if all(c_long):
-            risk = 2 * atr_cur
+            risk = sl_mult * atr_cur
             open_pos = {
                 "direction": "LONG", "entry": c,
-                "tp": c + 3 * atr_cur, "sl": c - 2 * atr_cur, "risk": risk,
+                "tp": c + tp_mult * atr_cur, "sl": c - sl_mult * atr_cur, "risk": risk,
             }
             debug["fired_conditions_sum"] += long_count
-            log.info(
-                "backtest %s LONG entry @ %.6g | ema1h=Y trend4h=up(price=%.6g vs ema4h=%.6g) "
-                "macd_cross=Y hist_grow=Y rsi=%.2f obv=bull vol=%.2fx adx=%.2f",
-                symbol, c, c, ema4h, rsi_cur,
-                vol_cur / vol_sma_cur if vol_sma_cur else 0.0, adx_cur,
-            )
+            if log_entries:
+                log.info(
+                    "backtest %s LONG entry @ %.6g | rsi=%.2f vol=%.2fx adx=%.2f",
+                    symbol, c, rsi_cur,
+                    vol_cur / vol_sma_cur if vol_sma_cur else 0.0, adx_cur,
+                )
         elif all(c_short):
-            risk = 2 * atr_cur
+            risk = sl_mult * atr_cur
             open_pos = {
                 "direction": "SHORT", "entry": c,
-                "tp": c - 3 * atr_cur, "sl": c + 2 * atr_cur, "risk": risk,
+                "tp": c - tp_mult * atr_cur, "sl": c + sl_mult * atr_cur, "risk": risk,
             }
             debug["fired_conditions_sum"] += short_count
-            log.info(
-                "backtest %s SHORT entry @ %.6g | ema1h=Y trend4h=down(price=%.6g vs ema4h=%.6g) "
-                "macd_cross=Y hist_grow=Y rsi=%.2f obv=bear vol=%.2fx adx=%.2f",
-                symbol, c, c, ema4h, rsi_cur,
-                vol_cur / vol_sma_cur if vol_sma_cur else 0.0, adx_cur,
-            )
+            if log_entries:
+                log.info(
+                    "backtest %s SHORT entry @ %.6g | rsi=%.2f vol=%.2fx adx=%.2f",
+                    symbol, c, rsi_cur,
+                    vol_cur / vol_sma_cur if vol_sma_cur else 0.0, adx_cur,
+                )
 
     return trades, debug
+
+
+def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame,
+                  sim_params: dict | None = None) -> tuple[list[dict], dict]:
+    if sim_params is None:
+        sim_params = dict(params)
+    precomp = _precompute_bt(df_1h, df_4h)
+    return _simulate_with_precomp(symbol, precomp, sim_params, log_entries=True)
 
 
 def handle_backtest_command(reply_to_message_id: int | None = None) -> None:
@@ -743,6 +846,201 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
         )
 
 
+def handle_optimize_command(reply_to_message_id: int | None = None) -> None:
+    log.info("Processing /optimize command")
+    send_telegram(
+        "<b>Optimization started</b>\n"
+        "Fetching 6 months of 1H + 4H data for 20 pairs and grid-searching "
+        "243 parameter combinations on a 4-month optimization window, then "
+        "validating the top 5 on a held-out 2-month window. "
+        "Will take several minutes.",
+        reply_to_message_id=reply_to_message_id,
+    )
+    threading.Thread(
+        target=_run_optimize, args=(reply_to_message_id,), daemon=True
+    ).start()
+
+
+def _run_optimize(reply_to_message_id: int | None) -> None:
+    import itertools
+    try:
+        opt_precomp: dict[str, dict] = {}
+        val_precomp: dict[str, dict] = {}
+        opt_dates: list = []
+        val_dates: list = []
+
+        for symbol in PAIRS:
+            try:
+                df_1h = fetch_klines_paginated(symbol, "1h", target=4320)
+                df_4h = fetch_klines_paginated(symbol, "4h", target=1080)
+                if len(df_1h) < 400 or len(df_4h) < 100:
+                    log.warning("optimize %s: insufficient data (1h=%d, 4h=%d)",
+                                symbol, len(df_1h), len(df_4h))
+                    continue
+                split_1h = (len(df_1h) * 4) // 6
+                split_4h = (len(df_4h) * 4) // 6
+                df_1h_opt = df_1h.iloc[:split_1h].reset_index(drop=True)
+                df_1h_val = df_1h.iloc[split_1h:].reset_index(drop=True)
+                df_4h_opt = df_4h.iloc[:split_4h].reset_index(drop=True)
+                df_4h_val = df_4h.iloc[split_4h:].reset_index(drop=True)
+                if len(df_1h_val) < 200 or len(df_4h_val) < 50:
+                    log.warning("optimize %s: validation window too short", symbol)
+                    continue
+                opt_precomp[symbol] = _precompute_bt(df_1h_opt, df_4h_opt)
+                val_precomp[symbol] = _precompute_bt(df_1h_val, df_4h_val)
+                opt_dates.append((df_1h_opt["close_time"].iloc[0],
+                                  df_1h_opt["close_time"].iloc[-1]))
+                val_dates.append((df_1h_val["close_time"].iloc[0],
+                                  df_1h_val["close_time"].iloc[-1]))
+            except Exception as e:
+                log.exception("optimize %s fetch failed: %s", symbol, e)
+
+        if not opt_precomp:
+            send_telegram("Optimize failed: no pair data available.",
+                          reply_to_message_id=reply_to_message_id)
+            return
+
+        opt_start = min(d[0] for d in opt_dates)
+        opt_end = max(d[1] for d in opt_dates)
+        val_start = min(d[0] for d in val_dates)
+        val_end = max(d[1] for d in val_dates)
+
+        adx_grid = [20, 25, 30]
+        rsi_grid = [(30, 70), (35, 65), (40, 60)]
+        vol_grid = [1.1, 1.2, 1.5]
+        sl_grid = [1.5, 2.0, 2.5]
+        tp_grid = [2.5, 3.0, 3.5]
+
+        combos = []
+        for adx_t, rsi_r, v, sm, tm in itertools.product(
+            adx_grid, rsi_grid, vol_grid, sl_grid, tp_grid
+        ):
+            combos.append({
+                "adx_threshold": adx_t,
+                "rsi_lo": rsi_r[0],
+                "rsi_hi": rsi_r[1],
+                "volume_mult": v,
+                "sl_mult": sm,
+                "tp_mult": tm,
+            })
+
+        log.info("optimize: %d combos x %d pairs on opt window",
+                 len(combos), len(opt_precomp))
+
+        opt_results: list[dict] = []
+        for idx, combo in enumerate(combos):
+            total_trades = 0
+            total_wins = 0
+            for symbol, precomp in opt_precomp.items():
+                try:
+                    trades, _ = _simulate_with_precomp(
+                        symbol, precomp, combo, log_entries=False
+                    )
+                    total_trades += len(trades)
+                    total_wins += sum(1 for t in trades if t["result"] == "win")
+                except Exception as e:
+                    log.exception("optimize %s combo %d failed: %s", symbol, idx, e)
+            if total_trades < 50:
+                continue
+            wr = 100.0 * total_wins / total_trades
+            opt_results.append({
+                "params": combo,
+                "trades": total_trades,
+                "wins": total_wins,
+                "wr_opt": wr,
+            })
+            if (idx + 1) % 50 == 0:
+                log.info("optimize: %d/%d combos evaluated", idx + 1, len(combos))
+
+        if not opt_results:
+            send_telegram(
+                "Optimize finished but no parameter combination produced 50+ trades. "
+                "Try widening the data window or relaxing filters.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        opt_results.sort(key=lambda x: x["wr_opt"], reverse=True)
+        top5 = opt_results[:5]
+        log.info("optimize: top opt-window WR = %.2f%%", top5[0]["wr_opt"])
+
+        for entry in top5:
+            v_trades = 0
+            v_wins = 0
+            for symbol, precomp in val_precomp.items():
+                try:
+                    trades, _ = _simulate_with_precomp(
+                        symbol, precomp, entry["params"], log_entries=False
+                    )
+                    v_trades += len(trades)
+                    v_wins += sum(1 for t in trades if t["result"] == "win")
+                except Exception as e:
+                    log.exception("validate %s failed: %s", symbol, e)
+            entry["val_trades"] = v_trades
+            entry["val_wins"] = v_wins
+            entry["wr_val"] = (100.0 * v_wins / v_trades) if v_trades else 0.0
+            entry["wr_avg"] = (entry["wr_opt"] + entry["wr_val"]) / 2
+
+        top5.sort(key=lambda x: x["wr_avg"], reverse=True)
+        winner = top5[0]
+
+        params.update(winner["params"])
+        save_params()
+        log.info("optimize: new parameters active: %s", params)
+
+        def fmt_combo(p: dict) -> str:
+            return (
+                f"adx>{p['adx_threshold']:>2} "
+                f"rsi{p['rsi_lo']:>2}-{p['rsi_hi']:>2} "
+                f"vol{p['volume_mult']:.1f} "
+                f"sl{p['sl_mult']:.1f} "
+                f"tp{p['tp_mult']:.1f}"
+            )
+
+        lines = ["<b>Optimization complete</b>"]
+        lines.append(
+            f"Opt window: {opt_start.strftime('%Y-%m-%d')} -> "
+            f"{opt_end.strftime('%Y-%m-%d')}"
+        )
+        lines.append(
+            f"Val window: {val_start.strftime('%Y-%m-%d')} -> "
+            f"{val_end.strftime('%Y-%m-%d')}"
+        )
+        lines.append(f"Pairs evaluated: {len(opt_precomp)} / {len(PAIRS)}")
+        lines.append(f"Combos with >=50 trades: {len(opt_results)} / {len(combos)}")
+        lines.append("")
+        lines.append("<b>Top 5 from opt window (sorted by combined avg)</b>")
+        lines.append("<pre>")
+        lines.append(f"{'#':<2}{'combo':<36}{'opt%':>7}{'val%':>7}{'avg%':>7}{'trades':>8}")
+        for i, e in enumerate(top5, 1):
+            lines.append(
+                f"{i:<2}{fmt_combo(e['params']):<36}"
+                f"{e['wr_opt']:>6.1f}%{e['wr_val']:>6.1f}%{e['wr_avg']:>6.1f}%"
+                f"{e['trades']:>8}"
+            )
+        lines.append("</pre>")
+        lines.append("")
+        lines.append(f"<b>Winner:</b> {fmt_combo(winner['params'])}")
+        lines.append(
+            f"Opt WR: {winner['wr_opt']:.1f}% | "
+            f"Val WR: {winner['wr_val']:.1f}% | "
+            f"Avg: {winner['wr_avg']:.1f}%"
+        )
+        lines.append("")
+        lines.append("<b>New live parameters active:</b>")
+        lines.append(f"<pre>{params_text()}</pre>")
+        lines.append("")
+        lines.append("<i>Past performance does not guarantee future results.</i>")
+
+        send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
+    except Exception as e:
+        log.exception("optimize failed: %s", e)
+        send_telegram(
+            f"<b>Optimize failed</b>\n{e}",
+            reply_to_message_id=reply_to_message_id,
+        )
+
+
 def telegram_poll_loop() -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram polling disabled (missing credentials)")
@@ -786,6 +1084,8 @@ def telegram_poll_loop() -> None:
                     handle_check_command(msg.get("message_id"))
                 elif cmd == "/backtest":
                     handle_backtest_command(msg.get("message_id"))
+                elif cmd == "/optimize":
+                    handle_optimize_command(msg.get("message_id"))
         except Exception as e:
             log.warning("Telegram poll error: %s", e)
             time.sleep(5)
@@ -850,13 +1150,14 @@ def scan_once() -> None:
 def main() -> None:
     log.info("binance-signal-bot starting (state path: %s)", STATE_PATH)
     load_state()
+    load_params()
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
         f"Watching {len(PAIRS)} pairs on {TIMEFRAME}.\n"
         "Strategy: 4H trend confirmation + 1H entry timing "
-        "(EMA100 + RSI + MACD + OBV + volume spike + ADX>25).\n"
-        "TP at 3x ATR, SL at 2x ATR (1.5:1 reward:risk).\n"
+        "(EMA100 + RSI + MACD + OBV + volume spike + ADX).\n"
+        f"Live params: {params_text()}\n"
         f"{win_rate_text()}\n"
         f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
     )
