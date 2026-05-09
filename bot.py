@@ -2651,25 +2651,9 @@ def _d2s100_sig(p, i):
 _register("e100_adaptive_regime", "Adaptive Regime (Hurst switch)", _d2s100_pre, _d2s100_sig, None, group="discover2")
 
 
+# /discover2 is now an alias of /discover (both run all strategies and rank)
 def handle_discover2_command(reply_to_message_id: int | None = None) -> None:
-    global discover_running
-    with discover_lock:
-        if discover_running:
-            send_telegram("Discovery already in progress.",
-                          reply_to_message_id=reply_to_message_id)
-            return
-        discover_running = True
-    n_strats = len([s for s in STRATEGIES if s.group == "discover2"])
-    send_telegram(
-        f"<b>Strategy discovery 2 started</b>\n"
-        f"Testing {n_strats} unconventional strategies on 6mo of 1H data across 20 pairs. "
-        "Pass = opt WR >= 60% AND val WR >= 55% AND >= 100 trades on opt window. "
-        "This will take quite a while.",
-        reply_to_message_id=reply_to_message_id,
-    )
-    threading.Thread(
-        target=_run_discover, args=(reply_to_message_id, "discover2"), daemon=True
-    ).start()
+    return handle_discover_command(reply_to_message_id)
 
 
 # ===== Strategy persistence and discovery loop =====
@@ -2791,27 +2775,30 @@ def handle_discover_command(reply_to_message_id: int | None = None) -> None:
                           reply_to_message_id=reply_to_message_id)
             return
         discover_running = True
+    n_strats = len(STRATEGIES)
     send_telegram(
-        "<b>Strategy discovery started</b>\n"
-        "Testing 10 well-known strategies on 6 months of 1H data across 20 pairs. "
-        "Pass = opt WR >= 60% AND val WR >= 55% AND >= 100 trades on opt window.",
+        f"<b>Strategy discovery started</b>\n"
+        f"Testing all {n_strats} strategies (10 well-known + 100 unconventional) "
+        "on 6 months of 1H data across 20 pairs. "
+        "All will be ranked by combined opt+val win rate; the top one will be activated. "
+        "This will take a while.",
         reply_to_message_id=reply_to_message_id,
     )
     threading.Thread(
-        target=_run_discover, args=(reply_to_message_id, "discover"), daemon=True
+        target=_run_discover, args=(reply_to_message_id,), daemon=True
     ).start()
 
 
-def _run_discover(reply_to_message_id: int | None, group: str) -> None:
+def _run_discover(reply_to_message_id: int | None) -> None:
     global active_strategy_id, discover_running
     try:
-        strategies = [s for s in STRATEGIES if s.group == group]
+        strategies = list(STRATEGIES)
         if not strategies:
-            send_telegram(f"No strategies registered for {group}.",
+            send_telegram("No strategies registered.",
                           reply_to_message_id=reply_to_message_id)
             return
 
-        log.info("%s: fetching 6mo data for %d pairs", group, len(PAIRS))
+        log.info("discover: fetching 6mo data for %d pairs", len(PAIRS))
         all_data = {}
         for symbol in PAIRS:
             try:
@@ -2820,10 +2807,10 @@ def _run_discover(reply_to_message_id: int | None, group: str) -> None:
                     continue
                 all_data[symbol] = df
             except Exception as e:
-                log.exception("%s %s fetch failed: %s", group, symbol, e)
+                log.exception("discover %s fetch failed: %s", symbol, e)
 
         if not all_data:
-            send_telegram(f"{group} failed: no pair data available.",
+            send_telegram("Discover failed: no pair data available.",
                           reply_to_message_id=reply_to_message_id)
             return
 
@@ -2845,7 +2832,7 @@ def _run_discover(reply_to_message_id: int | None, group: str) -> None:
         val_end = max(d[1] for d in val_dates)
 
         all_results = []
-        progress_every = 2 if group == "discover" else 10
+        progress_every = 10
         for idx, strat in enumerate(strategies, 1):
             opt_total = 0; opt_wins = 0
             val_total = 0; val_wins = 0
@@ -2855,28 +2842,29 @@ def _run_discover(reply_to_message_id: int | None, group: str) -> None:
                     opt_total += len(t)
                     opt_wins += sum(1 for x in t if x["result"] == "win")
                 except Exception as e:
-                    log.exception("%s opt %s/%s failed: %s", group, strat.id, sym, e)
+                    log.exception("discover opt %s/%s failed: %s", strat.id, sym, e)
                 try:
                     t = backtest_strategy(strat, val_data[sym])
                     val_total += len(t)
                     val_wins += sum(1 for x in t if x["result"] == "win")
                 except Exception as e:
-                    log.exception("%s val %s/%s failed: %s", group, strat.id, sym, e)
+                    log.exception("discover val %s/%s failed: %s", strat.id, sym, e)
             opt_wr = (100 * opt_wins / opt_total) if opt_total else 0.0
             val_wr = (100 * val_wins / val_total) if val_total else 0.0
             overfit = abs(opt_wr - val_wr) > 15
             passed = opt_wr >= 60 and val_wr >= 55 and opt_total >= 100
+            avg_wr = (opt_wr + val_wr) / 2
             result = {
                 "idx": idx, "id": strat.id, "name": strat.name,
                 "opt_total": opt_total, "opt_wr": opt_wr,
                 "val_total": val_total, "val_wr": val_wr,
-                "overfit": overfit, "passed": passed,
+                "avg_wr": avg_wr, "overfit": overfit, "passed": passed,
             }
             all_results.append(result)
             log.info(
-                "%s %d/%d %s: opt=%.1f%%(%d) val=%.1f%%(%d) %s",
-                group, idx, len(strategies), strat.id,
-                opt_wr, opt_total, val_wr, val_total,
+                "discover %d/%d %s: opt=%.1f%%(%d) val=%.1f%%(%d) avg=%.1f %s",
+                idx, len(strategies), strat.id,
+                opt_wr, opt_total, val_wr, val_total, avg_wr,
                 "PASS" if passed else "fail",
             )
             if passed or idx % progress_every == 0 or idx == len(strategies):
@@ -2884,58 +2872,68 @@ def _run_discover(reply_to_message_id: int | None, group: str) -> None:
                     "overfit" if overfit else "fail"
                 )
                 send_telegram(
-                    f"{group} {idx}/{len(strategies)} <b>{strat.name}</b>: "
+                    f"discover {idx}/{len(strategies)} <b>{strat.name}</b>: "
                     f"opt {opt_wr:.1f}% (n={opt_total}), "
                     f"val {val_wr:.1f}% (n={val_total}) - {tag}",
                     reply_to_message_id=reply_to_message_id,
                 )
-            if passed:
-                active_strategy_id = strat.id
-                save_strategy(strat.id, result)
-                send_telegram(
-                    f"<b>Winner: {strat.name}</b>\n"
-                    f"ID: {strat.id}\n"
-                    f"Opt: {opt_start.strftime('%Y-%m-%d')} -> "
-                    f"{opt_end.strftime('%Y-%m-%d')} | "
-                    f"Val: {val_start.strftime('%Y-%m-%d')} -> "
-                    f"{val_end.strftime('%Y-%m-%d')}\n"
-                    f"Opt WR: {opt_wr:.2f}% on {opt_total} trades\n"
-                    f"Val WR: {val_wr:.2f}% on {val_total} trades\n"
-                    f"<i>Activated for live scanning.</i>",
-                    reply_to_message_id=reply_to_message_id,
-                )
-                return
 
-        # No winner — pick best by combined avg
-        scored = [r for r in all_results if r["opt_total"] > 0]
+        # All strategies tested — rank by combined avg WR
+        scored = [r for r in all_results if r["opt_total"] > 0 or r["val_total"] > 0]
         if not scored:
-            send_telegram(f"{group} finished: no strategy produced trades.",
+            send_telegram("Discover finished: no strategy produced any trades.",
                           reply_to_message_id=reply_to_message_id)
             return
-        scored.sort(key=lambda r: (r["opt_wr"] + r["val_wr"]) / 2, reverse=True)
+        scored.sort(key=lambda r: r["avg_wr"], reverse=True)
         best = scored[0]
         active_strategy_id = best["id"]
         save_strategy(best["id"], best)
-        all_results.sort(key=lambda r: (r["opt_wr"] + r["val_wr"]) / 2, reverse=True)
-        lines = [
-            f"<b>{group} complete: no strategy met thresholds</b>",
-            f"Best by combined avg: <b>{best['name']}</b> "
-            f"(opt {best['opt_wr']:.1f}%, val {best['val_wr']:.1f}%) - activated",
-            "",
-            "<pre>",
-            f"{'#':<3}{'name':<30}{'opt%':>6}{'val%':>6}{'optN':>6}",
+
+        all_results.sort(key=lambda r: r["avg_wr"], reverse=True)
+        passed_count = sum(1 for r in all_results if r["passed"])
+        n_total = len(all_results)
+
+        # Telegram message limit is 4096 chars. Split into chunks if needed.
+        header_lines = [
+            f"<b>Discover complete: ranked {n_total} strategies</b>",
+            f"Strategies meeting all gates (opt>=60%, val>=55%, trades>=100): "
+            f"{passed_count}/{n_total}",
+            f"Opt: {opt_start.strftime('%Y-%m-%d')} -> "
+            f"{opt_end.strftime('%Y-%m-%d')} | "
+            f"Val: {val_start.strftime('%Y-%m-%d')} -> "
+            f"{val_end.strftime('%Y-%m-%d')}",
+            f"<b>Top by combined avg activated:</b> {best['name']}",
+            f"opt {best['opt_wr']:.2f}% (n={best['opt_total']}), "
+            f"val {best['val_wr']:.2f}% (n={best['val_total']}), "
+            f"avg {best['avg_wr']:.2f}%",
         ]
-        for r in all_results[:30]:
-            n_short = r["name"][:29]
-            lines.append(
-                f"{r['idx']:<3}{n_short:<30}{r['opt_wr']:>5.1f}%"
-                f"{r['val_wr']:>5.1f}%{r['opt_total']:>6}"
-            )
-        lines.append("</pre>")
-        send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
+        send_telegram("\n".join(header_lines),
+                      reply_to_message_id=reply_to_message_id)
+
+        # Send ranking in chunks of ~30 strategies per message
+        chunk_size = 30
+        chunks = [all_results[i:i + chunk_size]
+                  for i in range(0, len(all_results), chunk_size)]
+        for ci, chunk in enumerate(chunks, 1):
+            lines = [
+                f"<b>Ranking {ci}/{len(chunks)}</b>",
+                "<pre>",
+                f"{'rk':<3}{'name':<28}{'opt%':>6}{'val%':>6}{'avg%':>6}{'optN':>5}{'flag':>5}",
+            ]
+            for rank, r in enumerate(chunk, 1 + (ci - 1) * chunk_size):
+                n_short = r["name"][:27]
+                flag = "PASS" if r["passed"] else ("OF" if r["overfit"] else "")
+                lines.append(
+                    f"{rank:<3}{n_short:<28}{r['opt_wr']:>5.1f}%"
+                    f"{r['val_wr']:>5.1f}%{r['avg_wr']:>5.1f}%"
+                    f"{r['opt_total']:>5}{flag:>5}"
+                )
+            lines.append("</pre>")
+            send_telegram("\n".join(lines),
+                          reply_to_message_id=reply_to_message_id)
     except Exception as e:
-        log.exception("%s failed: %s", group, e)
-        send_telegram(f"<b>{group} failed</b>\n{e}",
+        log.exception("discover failed: %s", e)
+        send_telegram(f"<b>Discover failed</b>\n{e}",
                       reply_to_message_id=reply_to_message_id)
     finally:
         with discover_lock:
