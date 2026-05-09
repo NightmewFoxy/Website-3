@@ -163,7 +163,21 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def evaluate(df: pd.DataFrame) -> dict:
+_4h_trend_cache: dict[str, str] = {}
+
+
+def get_4h_trend(symbol: str) -> str:
+    if symbol in _4h_trend_cache:
+        return _4h_trend_cache[symbol]
+    df = fetch_klines(symbol, interval="4h", limit=50)
+    ema100_4h = ema(df["close"], 100).iloc[-1]
+    price = df["close"].iloc[-1]
+    trend = "up" if price > ema100_4h else "down"
+    _4h_trend_cache[symbol] = trend
+    return trend
+
+
+def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     close = df["close"]
     volume = df["volume"]
     high = df["high"]
@@ -171,33 +185,62 @@ def evaluate(df: pd.DataFrame) -> dict:
 
     ema100 = ema(close, 100)
     rsi14 = rsi(close, 14)
-    macd_line, signal_line, _ = macd(close)
+    macd_line, signal_line, hist = macd(close)
     obv_line = obv(close, volume)
     obv_ema = ema(obv_line, 20)
     atr14 = atr(high, low, close, 14)
+    volume_sma20 = volume.rolling(window=20).mean()
 
     price = close.iloc[-1]
     ema100_now = ema100.iloc[-1]
     rsi_now, rsi_prev = rsi14.iloc[-1], rsi14.iloc[-2]
     macd_now, macd_prev = macd_line.iloc[-1], macd_line.iloc[-2]
     sig_now, sig_prev = signal_line.iloc[-1], signal_line.iloc[-2]
+    hist_now, hist_prev = hist.iloc[-1], hist.iloc[-2]
     obv_now = obv_line.iloc[-1]
     obv_ema_now = obv_ema.iloc[-1]
     atr_now = atr14.iloc[-1]
+    vol_now = volume.iloc[-1]
+    vol_sma_now = volume_sma20.iloc[-1]
 
     macd_cross_up = macd_prev <= sig_prev and macd_now > sig_now
     macd_cross_down = macd_prev >= sig_prev and macd_now < sig_now
+    hist_growing_up = hist_now > hist_prev
+    hist_growing_down = hist_now < hist_prev
 
-    rsi_long_ok = rsi_now < 60 or (rsi_prev < 30 and rsi_now > rsi_prev)
-    rsi_short_ok = rsi_now > 40 or (rsi_prev > 70 and rsi_now < rsi_prev)
+    rsi_in_range = 35 <= rsi_now <= 65
+    rsi_long_bounce = rsi_prev < 30 and rsi_now > rsi_prev
+    rsi_short_rollover = rsi_prev > 70 and rsi_now < rsi_prev
+    rsi_long_ok = rsi_in_range or rsi_long_bounce
+    rsi_short_ok = rsi_in_range or rsi_short_rollover
 
     obv_bull = obv_now > obv_ema_now
     obv_bear = obv_now < obv_ema_now
 
+    volume_ok = bool(pd.notna(vol_sma_now) and vol_now >= 1.2 * vol_sma_now)
+
+    trend_4h = get_4h_trend(symbol)
+
     direction = None
-    if price > ema100_now and macd_cross_up and rsi_long_ok and obv_bull:
+    if (
+        price > ema100_now
+        and trend_4h == "up"
+        and macd_cross_up
+        and hist_growing_up
+        and rsi_long_ok
+        and obv_bull
+        and volume_ok
+    ):
         direction = "LONG"
-    elif price < ema100_now and macd_cross_down and rsi_short_ok and obv_bear:
+    elif (
+        price < ema100_now
+        and trend_4h == "down"
+        and macd_cross_down
+        and hist_growing_down
+        and rsi_short_ok
+        and obv_bear
+        and volume_ok
+    ):
         direction = "SHORT"
 
     return {
@@ -215,6 +258,8 @@ def evaluate(df: pd.DataFrame) -> dict:
         "macd_cross_down": bool(macd_cross_down),
         "obv_bull": bool(obv_bull),
         "obv_bear": bool(obv_bear),
+        "trend_4h": trend_4h,
+        "volume_ok": volume_ok,
         "candle_time": df["close_time"].iloc[-1],
     }
 
@@ -224,11 +269,11 @@ def format_message(symbol: str, r: dict) -> str:
     price = r["price"]
     atr_v = r["atr"]
     if r["direction"] == "LONG":
-        tp = price + 2 * atr_v
-        sl = price - atr_v
+        tp = price + 3 * atr_v
+        sl = price - 1.5 * atr_v
     else:
-        tp = price - 2 * atr_v
-        sl = price + atr_v
+        tp = price - 3 * atr_v
+        sl = price + 1.5 * atr_v
     return (
         f"<b>{r['direction']} signal: {symbol}</b>\n"
         f"Timeframe: {TIMEFRAME}\n"
@@ -252,6 +297,8 @@ def check_long_exit(r: dict) -> list[str]:
         reasons.append(f"RSI overbought ({r['rsi']:.2f})")
     if r["obv_bear"]:
         reasons.append("OBV dropped below EMA")
+    if len(reasons) < 2:
+        return []
     return reasons
 
 
@@ -263,6 +310,8 @@ def check_short_exit(r: dict) -> list[str]:
         reasons.append(f"RSI oversold ({r['rsi']:.2f})")
     if r["obv_bull"]:
         reasons.append("OBV rose above EMA")
+    if len(reasons) < 2:
+        return []
     return reasons
 
 
@@ -279,13 +328,14 @@ def format_close_message(symbol: str, direction: str, r: dict, reasons: list[str
 
 def scan_once() -> None:
     log.info("Starting scan of %d pairs", len(PAIRS))
+    _4h_trend_cache.clear()
     for symbol in PAIRS:
         try:
             df = fetch_klines(symbol)
             if len(df) < 120:
                 log.warning("%s: not enough candles (%d)", symbol, len(df))
                 continue
-            result = evaluate(df)
+            result = evaluate(df, symbol)
 
             position = open_positions.get(symbol)
             if position == "LONG":
@@ -335,6 +385,9 @@ def main() -> None:
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
         f"Watching {len(PAIRS)} pairs on {TIMEFRAME}.\n"
+        "Strategy: 4H trend confirmation + 1H entry timing "
+        "(EMA100 + RSI + MACD + OBV + volume spike).\n"
+        "Targeting 58-68% win rate at 2:1 reward:risk.\n"
         f"{win_rate_text()}\n"
         f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
     )
