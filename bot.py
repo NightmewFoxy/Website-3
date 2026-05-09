@@ -38,6 +38,8 @@ last_signal_by_pair: dict[str, str] = {}
 open_positions: dict[str, str] = {}
 position_entry_price: dict[str, float] = {}
 trade_results: list[bool] = []
+closed_trades: list[dict] = []
+position_entry_meta: dict[str, dict] = {}
 
 STATE_PATH = os.environ.get(
     "STATE_PATH",
@@ -109,9 +111,11 @@ def load_state() -> None:
         open_positions.update(data.get("open_positions", {}))
         position_entry_price.update(data.get("position_entry_price", {}))
         last_signal_by_pair.update(data.get("last_signal_by_pair", {}))
+        closed_trades[:] = list(data.get("closed_trades", []))
+        position_entry_meta.update(data.get("position_entry_meta", {}))
         log.info(
-            "Loaded state: %d trades, %d open positions",
-            len(trade_results), len(open_positions),
+            "Loaded state: %d closed trades (rich), %d closed (legacy), %d open",
+            len(closed_trades), len(trade_results), len(open_positions),
         )
     except Exception as e:
         log.warning("Failed to load state from %s: %s", STATE_PATH, e)
@@ -129,7 +133,9 @@ def save_state() -> None:
                 "open_positions": open_positions,
                 "position_entry_price": position_entry_price,
                 "last_signal_by_pair": last_signal_by_pair,
-            }, f)
+                "closed_trades": closed_trades,
+                "position_entry_meta": position_entry_meta,
+            }, f, default=str)
         os.replace(tmp, STATE_PATH)
     except Exception as e:
         log.warning("Failed to save state to %s: %s", STATE_PATH, e)
@@ -3446,6 +3452,86 @@ def score_pair(df: pd.DataFrame, symbol: str) -> tuple[str, int]:
     return "SHORT", short_score
 
 
+def handle_win_command(reply_to_message_id: int | None = None) -> None:
+    log.info("Processing /win command")
+    if not closed_trades:
+        send_telegram(
+            "No completed trades yet. The bot needs to both open and close a "
+            "position for it to count. Check back after your first closed signal.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    n_closed = len(closed_trades)
+    n_open = len(open_positions)
+    n_total = n_closed + n_open
+
+    winners = [t for t in closed_trades if float(t.get("r", 0)) > 0]
+    losers = [t for t in closed_trades if float(t.get("r", 0)) <= 0]
+    n_win = len(winners)
+    n_loss = len(losers)
+    win_rate = (100.0 * n_win / n_closed) if n_closed else 0.0
+
+    avg_winner = (sum(float(t["r"]) for t in winners) / n_win) if n_win else 0.0
+    avg_loser = (sum(float(t["r"]) for t in losers) / n_loss) if n_loss else 0.0
+    expectancy = sum(float(t["r"]) for t in closed_trades) / n_closed
+
+    def _fmt_date(s: str) -> str:
+        if not s:
+            return "?"
+        try:
+            return str(s)[:10]
+        except Exception:
+            return str(s)
+
+    times = [t.get("entry_time", "") for t in closed_trades if t.get("entry_time")]
+    times.extend(
+        m.get("entry_time", "") for m in position_entry_meta.values()
+        if m.get("entry_time")
+    )
+    first_date = min(times) if times else ""
+    today = datetime.now(MYT).strftime("%Y-%m-%d")
+
+    best = max(closed_trades, key=lambda t: float(t.get("r", 0)))
+    worst = min(closed_trades, key=lambda t: float(t.get("r", 0)))
+
+    active = STRATEGIES_BY_ID.get(active_strategy_id) if active_strategy_id else None
+    strat_name = active.name if active else "(unknown)"
+    backtest_wr = float(getattr(active, "backtest_wr", 61.3)) if active else 61.3
+    diff = win_rate - backtest_wr
+    diff_str = f"{diff:+.1f} pp"
+
+    body = (
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"From: {_fmt_date(first_date)} to {today}\n"
+        "\n"
+        f"Total signals sent:     {n_total}\n"
+        f"Positions closed:       {n_closed}\n"
+        f" ├ Winners:             {n_win}\n"
+        f" ├ Losers:              {n_loss}\n"
+        f" └ Win Rate:            {win_rate:.1f}%\n"
+        "\n"
+        f"Avg winner:            {avg_winner:+.2f} R\n"
+        f"Avg loser:             {avg_loser:+.2f} R\n"
+        f"Expectancy:            {expectancy:+.2f} R\n"
+        "\n"
+        f"Still open:             {n_open} positions\n"
+        "\n"
+        f"Best trade:  {best['symbol']} {float(best['r']):+.2f} R "
+        f"({_fmt_date(best.get('exit_time', ''))})\n"
+        f"Worst trade: {worst['symbol']} {float(worst['r']):+.2f} R "
+        f"({_fmt_date(worst.get('exit_time', ''))})\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"Backtest WR: {backtest_wr:.1f}% (n=6274)\n"
+        f"Live vs Backtest: {diff_str}"
+    )
+    msg = (
+        f"\U0001F4CA <b>Live Performance — {strat_name}</b>\n"
+        f"<pre>{body}</pre>"
+    )
+    send_telegram(msg, reply_to_message_id=reply_to_message_id)
+
+
 def handle_check_command(reply_to_message_id: int | None = None) -> None:
     log.info("Processing /check command")
     rankings: list[tuple[str, str, int]] = []
@@ -4047,6 +4133,8 @@ def telegram_poll_loop() -> None:
                     handle_discover_command(msg.get("message_id"))
                 elif cmd == "/discover2":
                     handle_discover2_command(msg.get("message_id"))
+                elif cmd == "/win":
+                    handle_win_command(msg.get("message_id"))
         except Exception as e:
             log.warning("Telegram poll error: %s", e)
             time.sleep(5)
@@ -4072,8 +4160,21 @@ def scan_once() -> None:
                 if reasons:
                     send_telegram(format_close_message(symbol, "LONG", result, reasons))
                     entry = position_entry_price.pop(symbol, None)
+                    meta = position_entry_meta.pop(symbol, {})
+                    exit_price = float(result["price"])
+                    exit_time = str(result.get("candle_time", ""))
                     if entry is not None:
-                        trade_results.append(result["price"] > entry)
+                        trade_results.append(exit_price > entry)
+                        sl_dist = float(meta.get("sl_distance", 0.0))
+                        r_mult = ((exit_price - entry) / sl_dist) if sl_dist > 0 else 0.0
+                        closed_trades.append({
+                            "symbol": symbol, "direction": "LONG",
+                            "entry_price": float(entry), "exit_price": exit_price,
+                            "entry_time": meta.get("entry_time", ""),
+                            "exit_time": exit_time,
+                            "sl_distance": sl_dist, "r": r_mult,
+                            "exit_reason": "; ".join(reasons),
+                        })
                     open_positions.pop(symbol, None)
                     save_state()
                     log.info("%s: CLOSE LONG sent (%s)", symbol, "; ".join(reasons))
@@ -4082,8 +4183,21 @@ def scan_once() -> None:
                 if reasons:
                     send_telegram(format_close_message(symbol, "SHORT", result, reasons))
                     entry = position_entry_price.pop(symbol, None)
+                    meta = position_entry_meta.pop(symbol, {})
+                    exit_price = float(result["price"])
+                    exit_time = str(result.get("candle_time", ""))
                     if entry is not None:
-                        trade_results.append(result["price"] < entry)
+                        trade_results.append(exit_price < entry)
+                        sl_dist = float(meta.get("sl_distance", 0.0))
+                        r_mult = ((entry - exit_price) / sl_dist) if sl_dist > 0 else 0.0
+                        closed_trades.append({
+                            "symbol": symbol, "direction": "SHORT",
+                            "entry_price": float(entry), "exit_price": exit_price,
+                            "entry_time": meta.get("entry_time", ""),
+                            "exit_time": exit_time,
+                            "sl_distance": sl_dist, "r": r_mult,
+                            "exit_reason": "; ".join(reasons),
+                        })
                     open_positions.pop(symbol, None)
                     save_state()
                     log.info("%s: CLOSE SHORT sent (%s)", symbol, "; ".join(reasons))
@@ -4097,6 +4211,14 @@ def scan_once() -> None:
             last_signal_by_pair[symbol] = direction
             open_positions[symbol] = direction
             position_entry_price[symbol] = result["price"]
+            atr_at_entry = float(result.get("atr", 0.0) or 0.0)
+            sl_mult_v = float(params.get("sl_mult", 1.0) or 1.0)
+            position_entry_meta[symbol] = {
+                "entry_time": str(result.get("candle_time", "")),
+                "atr": atr_at_entry,
+                "sl_mult": sl_mult_v,
+                "sl_distance": atr_at_entry * sl_mult_v,
+            }
             save_state()
             msg = format_message(symbol, result)
             send_telegram(msg)
