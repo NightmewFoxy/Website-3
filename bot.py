@@ -165,7 +165,7 @@ def evaluate(df: pd.DataFrame) -> dict:
 
 
 def format_message(symbol: str, r: dict) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S GMT")
     price = r["price"]
     atr_v = r["atr"]
     if r["direction"] == "LONG":
@@ -212,7 +212,7 @@ def check_short_exit(r: dict) -> list[str]:
 
 
 def format_close_message(symbol: str, direction: str, r: dict, reasons: list[str]) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S GMT")
     return (
         f"<b>CLOSE {direction}: {symbol}</b>\n"
         f"Timeframe: {TIMEFRAME}\n"
@@ -269,7 +269,7 @@ def main() -> None:
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
         f"Watching {len(PAIRS)} pairs on {TIMEFRAME}.\n"
-        f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S GMT')}"
     )
     while True:
         start = time.time()
