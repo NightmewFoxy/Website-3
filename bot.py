@@ -34,6 +34,16 @@ log = logging.getLogger("binance-signal-bot")
 
 last_signal_by_pair: dict[str, str] = {}
 open_positions: dict[str, str] = {}
+position_entry_price: dict[str, float] = {}
+trade_results: list[bool] = []
+
+
+def win_rate_text() -> str:
+    if not trade_results:
+        return "Current win rate: N/A (0 trades)"
+    wins = sum(trade_results)
+    total = len(trade_results)
+    return f"Current win rate: {100 * wins / total:.1f}% ({wins}/{total})"
 
 
 def send_telegram(text: str) -> None:
@@ -239,12 +249,18 @@ def scan_once() -> None:
                 reasons = check_long_exit(result)
                 if reasons:
                     send_telegram(format_close_message(symbol, "LONG", result, reasons))
+                    entry = position_entry_price.pop(symbol, None)
+                    if entry is not None:
+                        trade_results.append(result["price"] > entry)
                     open_positions.pop(symbol, None)
                     log.info("%s: CLOSE LONG sent (%s)", symbol, "; ".join(reasons))
             elif position == "SHORT":
                 reasons = check_short_exit(result)
                 if reasons:
                     send_telegram(format_close_message(symbol, "SHORT", result, reasons))
+                    entry = position_entry_price.pop(symbol, None)
+                    if entry is not None:
+                        trade_results.append(result["price"] < entry)
                     open_positions.pop(symbol, None)
                     log.info("%s: CLOSE SHORT sent (%s)", symbol, "; ".join(reasons))
 
@@ -256,6 +272,7 @@ def scan_once() -> None:
                 continue
             last_signal_by_pair[symbol] = direction
             open_positions[symbol] = direction
+            position_entry_price[symbol] = result["price"]
             msg = format_message(symbol, result)
             send_telegram(msg)
             log.info("%s: %s signal sent", symbol, direction)
@@ -271,7 +288,8 @@ def main() -> None:
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
         f"Watching {len(PAIRS)} pairs on {TIMEFRAME}.\n"
-        f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S GMT')}"
+        f"{win_rate_text()}\n"
+        f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
     )
     while True:
         start = time.time()
