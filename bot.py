@@ -1,7 +1,9 @@
 import os
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+MYT = timezone(timedelta(hours=8), name="MYT")
 
 import numpy as np
 import pandas as pd
@@ -165,7 +167,7 @@ def evaluate(df: pd.DataFrame) -> dict:
 
 
 def format_message(symbol: str, r: dict) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S GMT")
+    ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S MYT")
     price = r["price"]
     atr_v = r["atr"]
     if r["direction"] == "LONG":
@@ -212,7 +214,7 @@ def check_short_exit(r: dict) -> list[str]:
 
 
 def format_close_message(symbol: str, direction: str, r: dict, reasons: list[str]) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S GMT")
+    ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S MYT")
     return (
         f"<b>CLOSE {direction}: {symbol}</b>\n"
         f"Timeframe: {TIMEFRAME}\n"
