@@ -2651,6 +2651,222 @@ def _d2s100_sig(p, i):
 _register("e100_adaptive_regime", "Adaptive Regime (Hurst switch)", _d2s100_pre, _d2s100_sig, None, group="discover2")
 
 
+# ===== Bonus strategies 111-120 =====
+
+# 111. Triple Screen (weekly MACD hist + daily Stoch + 1H RSI)
+def _d2s111_pre(df):
+    macd_line = ema(df["close"], 168) - ema(df["close"], 360)
+    sig_line = ema(macd_line, 36)
+    hist = macd_line - sig_line
+    k, _ = compute_stochastic(df["high"], df["low"], df["close"], 24, 3, 3)
+    return {"hist": hist, "stoch_k": k, "rsi": rsi(df["close"], 14)}
+def _d2s111_sig(p, i):
+    if i < 1: return None
+    h = p["hist"]; k = p["stoch_k"]; r = p["rsi"]
+    if any(pd.isna(x) for x in (h.iloc[i], h.iloc[i-1], k.iloc[i], k.iloc[i-1], r.iloc[i])):
+        return None
+    rising = h.iloc[i] > h.iloc[i-1]
+    falling = h.iloc[i] < h.iloc[i-1]
+    daily_long = k.iloc[i-1] < 20 and k.iloc[i] >= 20
+    daily_short = k.iloc[i-1] > 80 and k.iloc[i] <= 80
+    if rising and daily_long and r.iloc[i] < 40: return "LONG"
+    if falling and daily_short and r.iloc[i] > 60: return "SHORT"
+    return None
+_register("d111_triple_screen", "Triple Screen", _d2s111_pre, _d2s111_sig, None, group="discover2")
+
+
+# 112. Connors RSI
+def _streak(close):
+    n = len(close)
+    s = np.zeros(n)
+    cv = close.values
+    for i in range(1, n):
+        if np.isnan(cv[i]) or np.isnan(cv[i-1]):
+            s[i] = s[i-1]
+        elif cv[i] > cv[i-1]:
+            s[i] = s[i-1] + 1 if s[i-1] >= 0 else 1
+        elif cv[i] < cv[i-1]:
+            s[i] = s[i-1] - 1 if s[i-1] <= 0 else -1
+        else:
+            s[i] = 0
+    return pd.Series(s, index=close.index)
+def _d2s112_pre(df):
+    close = df["close"]
+    r3 = rsi(close, 3)
+    streak = _streak(close)
+    rs = rsi(streak, 2)
+    ret_1 = close.pct_change()
+    pct_rank = ret_1.rolling(100).rank(pct=True) * 100
+    crsi = (r3 + rs + pct_rank) / 3
+    return {"crsi": crsi}
+def _d2s112_sig(p, i):
+    cur = p["crsi"].iloc[i]
+    if pd.isna(cur): return None
+    if cur < 10: return "LONG"
+    if cur > 90: return "SHORT"
+    return None
+_register("d112_connors_rsi", "Connors RSI", _d2s112_pre, _d2s112_sig, None, group="discover2")
+
+
+# 113. Williams Large Trade Index
+def _d2s113_pre(df, n=10):
+    ll = df["low"].rolling(n).min()
+    hh = df["high"].rolling(n).max()
+    rng = (hh - ll).replace(0, np.nan)
+    return {"wlti": 100 * (df["close"] - ll) / rng}
+def _d2s113_sig(p, i):
+    if i < 1: return None
+    cur = p["wlti"].iloc[i]; prev = p["wlti"].iloc[i-1]
+    if pd.isna(cur) or pd.isna(prev): return None
+    if prev <= 20 and cur > 20: return "LONG"
+    if prev >= 80 and cur < 80: return "SHORT"
+    return None
+_register("d113_wlti", "Williams Large Trade Index", _d2s113_pre, _d2s113_sig, None, group="discover2")
+
+
+# 114. Commodity Selection Index momentum
+def _d2s114_pre(df):
+    a = atr(df["high"], df["low"], df["close"], 14)
+    adx14 = _d2s79_adx(df["high"], df["low"], df["close"], 14)
+    adx_slope = adx14 - adx14.shift(3)
+    csi = a * adx14 * adx_slope
+    return {"csi": csi, "csi_sma": csi.rolling(10).mean()}
+def _d2s114_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["csi"].iloc[i-1], p["csi"].iloc[i],
+                p["csi_sma"].iloc[i-1], p["csi_sma"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["csi"].iloc[i-1], p["csi"].iloc[i],
+                p["csi_sma"].iloc[i-1], p["csi_sma"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("d114_csi", "Commodity Selection Index", _d2s114_pre, _d2s114_sig, None, group="discover2")
+
+
+# 115. Trend Intensity Index
+def _d2s115_pre(df):
+    sma60 = df["close"].rolling(60).mean()
+    above = (df["close"] > sma60).astype(float)
+    return {"tii": 100 * above.rolling(30).mean()}
+def _d2s115_sig(p, i):
+    if i < 11: return None
+    cur = p["tii"].iloc[i]; prev = p["tii"].iloc[i-1]
+    if pd.isna(cur) or pd.isna(prev): return None
+    if prev <= 50 and cur > 50:
+        if any(pd.notna(p["tii"].iloc[i-k]) and p["tii"].iloc[i-k] < 30 for k in range(2, 11)):
+            return "LONG"
+    if prev >= 50 and cur < 50:
+        if any(pd.notna(p["tii"].iloc[i-k]) and p["tii"].iloc[i-k] > 70 for k in range(2, 11)):
+            return "SHORT"
+    return None
+_register("d115_tii", "Trend Intensity Index", _d2s115_pre, _d2s115_sig, None, group="discover2")
+
+
+# 116. Projection Oscillator
+def _d2s116_pre(df, period=14):
+    def _project(x):
+        if np.any(np.isnan(x)): return float("nan")
+        slope, intercept = np.polyfit(np.arange(len(x)), x, 1)
+        return float(slope * len(x) + intercept)
+    proj = df["close"].rolling(period).apply(_project, raw=True)
+    return {"proj": proj, "rsi": rsi(df["close"], 14), "close": df["close"]}
+def _d2s116_sig(p, i):
+    c = p["close"].iloc[i]; pr = p["proj"].iloc[i]; r = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (c, pr, r)) or pr <= 0: return None
+    diff_pct = (c - pr) / pr
+    if diff_pct < -0.02 and r < 45: return "LONG"
+    if diff_pct > 0.02 and r > 55: return "SHORT"
+    return None
+_register("d116_projection", "Projection Oscillator", _d2s116_pre, _d2s116_sig, None, group="discover2")
+
+
+# 117. Chande Forecast Oscillator
+def _d2s117_pre(df, period=14):
+    def _ep(x):
+        if np.any(np.isnan(x)): return float("nan")
+        slope, intercept = np.polyfit(np.arange(len(x)), x, 1)
+        return float(slope * (len(x) - 1) + intercept)
+    lr_end = df["close"].rolling(period).apply(_ep, raw=True)
+    cfo = 100 * (df["close"] - lr_end) / df["close"].replace(0, np.nan)
+    return {"cfo": cfo}
+def _d2s117_sig(p, i):
+    if i < 1: return None
+    cur = p["cfo"].iloc[i]; prev = p["cfo"].iloc[i-1]
+    if pd.isna(cur) or pd.isna(prev): return None
+    if prev <= -3 and cur > -3: return "LONG"
+    if prev >= 3 and cur < 3: return "SHORT"
+    return None
+_register("d117_cfo", "Chande Forecast Oscillator", _d2s117_pre, _d2s117_sig, None, group="discover2")
+
+
+# 118. Price Volume Trend
+def _d2s118_pre(df):
+    ret = df["close"].pct_change().fillna(0)
+    pvt = (ret * df["volume"]).cumsum()
+    return {"pvt": pvt, "pvt_ema": ema(pvt, 21)}
+def _d2s118_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["pvt"].iloc[i-1], p["pvt"].iloc[i],
+                p["pvt_ema"].iloc[i-1], p["pvt_ema"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["pvt"].iloc[i-1], p["pvt"].iloc[i],
+                p["pvt_ema"].iloc[i-1], p["pvt_ema"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("d118_pvt", "Price Volume Trend", _d2s118_pre, _d2s118_sig, None, group="discover2")
+
+
+# 119. Demand Index
+def _d2s119_pre(df):
+    bp = df["volume"] * (2 * df["close"] + df["high"] - 3 * df["low"]) / 3
+    sp = df["volume"] * (3 * df["high"] - 2 * df["close"] - df["low"]) / 3
+    di = (bp - sp) / (bp + sp).replace(0, np.nan)
+    return {"di": di}
+def _d2s119_sig(p, i):
+    if i < 1: return None
+    cur = p["di"].iloc[i]; prev = p["di"].iloc[i-1]
+    if pd.isna(cur) or pd.isna(prev): return None
+    if prev <= 0 and cur > 0: return "LONG"
+    if prev >= 0 and cur < 0: return "SHORT"
+    return None
+_register("d119_demand_index", "Demand Index", _d2s119_pre, _d2s119_sig, None, group="discover2")
+
+
+# 120. QQE (Quantitative Qualitative Estimation)
+def _d2s120_pre(df):
+    r = rsi(df["close"], 14)
+    fast = ema(r, 5)
+    tr_rsi = (fast - fast.shift(1)).abs()
+    atr_rsi = tr_rsi.ewm(alpha=1/4, adjust=False).mean()
+    smoothed_atr = atr_rsi.ewm(alpha=1/4.236, adjust=False).mean()
+    n = len(df)
+    fast_v = fast.values
+    atr_v = smoothed_atr.values
+    slow = np.full(n, np.nan)
+    for i in range(1, n):
+        if np.isnan(fast_v[i]) or np.isnan(atr_v[i]):
+            continue
+        cand_dn = fast_v[i] - atr_v[i] * 4.236
+        cand_up = fast_v[i] + atr_v[i] * 4.236
+        if np.isnan(slow[i-1]):
+            slow[i] = cand_dn
+            continue
+        if fast_v[i] > slow[i-1]:
+            slow[i] = max(slow[i-1], cand_dn)
+        else:
+            slow[i] = min(slow[i-1], cand_up)
+    return {"qqe_fast": fast, "qqe_slow": pd.Series(slow, index=df.index)}
+def _d2s120_sig(p, i):
+    if i < 1: return None
+    fp = p["qqe_fast"].iloc[i-1]; fc = p["qqe_fast"].iloc[i]
+    sp = p["qqe_slow"].iloc[i-1]; sc = p["qqe_slow"].iloc[i]
+    if any(pd.isna(x) for x in (fp, fc, sp, sc)): return None
+    if fp <= sp and fc > sc and fc < 50: return "LONG"
+    if fp >= sp and fc < sc and fc > 50: return "SHORT"
+    return None
+_register("d120_qqe", "QQE", _d2s120_pre, _d2s120_sig, None, group="discover2")
+
+
 # /discover2 is now an alias of /discover (both run all strategies and rank)
 def handle_discover2_command(reply_to_message_id: int | None = None) -> None:
     return handle_discover_command(reply_to_message_id)
