@@ -634,7 +634,10 @@ _register("d8_heikin_ashi", "Heikin Ashi Trend", _s8_pre, _s8_sig, _s8_exit)
 
 
 def _s9_pre(df):
-    return {"wr": compute_williams_r(df["high"], df["low"], df["close"], 14)}
+    return {
+        "wr": compute_williams_r(df["high"], df["low"], df["close"], 14),
+        "close": df["close"],
+    }
 def _s9_sig(p, i):
     if i < 1: return None
     wp = p["wr"].iloc[i-1]; wc = p["wr"].iloc[i]
@@ -649,6 +652,66 @@ def _s9_exit(p, i, d):
     if d == "SHORT" and wc <= -50: return f"W%R hit -50 ({wc:.1f})"
     return False
 _register("d9_williams_r", "Williams %R", _s9_pre, _s9_sig, _s9_exit)
+
+
+def _w9_score(p, i):
+    """Williams %R /check scoring: 4 weighted conditions, 100 pts total."""
+    if i < 0 or "wr" not in p:
+        return 0, 0
+    wr = p["wr"]
+    n = len(wr)
+    if i >= n:
+        return 0, 0
+    wr_now = wr.iloc[i]
+    wr_prev = wr.iloc[i - 1] if i >= 1 else float("nan")
+    wr_prev2 = wr.iloc[i - 2] if i >= 2 else float("nan")
+
+    long_score = 0
+    short_score = 0
+
+    # Condition 1 (40 pts): in extreme zone
+    if pd.notna(wr_now):
+        if wr_now < -80:
+            long_score += 40
+        if wr_now > -20:
+            short_score += 40
+
+    # Condition 2 (25 pts): cross of threshold within last 2 candles
+    if pd.notna(wr_now) and pd.notna(wr_prev):
+        long_cross_now = wr_prev <= -80 and wr_now > -80
+        short_cross_now = wr_prev >= -20 and wr_now < -20
+        long_cross_prev = (
+            pd.notna(wr_prev2) and wr_prev2 <= -80 and wr_prev > -80
+        )
+        short_cross_prev = (
+            pd.notna(wr_prev2) and wr_prev2 >= -20 and wr_prev < -20
+        )
+        if long_cross_now or long_cross_prev:
+            long_score += 25
+        if short_cross_now or short_cross_prev:
+            short_score += 25
+
+    # Condition 3 (20 pts): turning in reversal direction
+    if pd.notna(wr_now) and pd.notna(wr_prev):
+        if wr_now > wr_prev:
+            long_score += 20
+        if wr_now < wr_prev:
+            short_score += 20
+
+    # Condition 4 (15 pts): ATR >= 0.3% of price (volatility filter)
+    if "atr" in p and "close" in p and i < len(p["atr"]) and i < len(p["close"]):
+        a = p["atr"].iloc[i]
+        c = p["close"].iloc[i]
+        if pd.notna(a) and pd.notna(c) and c > 0 and a >= 0.003 * c:
+            long_score += 15
+            short_score += 15
+
+    return long_score, short_score
+
+
+# Override score_at on the registered Williams %R instance.
+# Assigning a plain function bypasses descriptor binding so no `self` is needed.
+STRATEGIES_BY_ID["d9_williams_r"].score_at = lambda p, i: _w9_score(p, i)
 
 
 def _s10_pre(df):
@@ -2883,22 +2946,38 @@ discover_running = False
 discover_lock = threading.Lock()
 
 
+FORCED_STRATEGY_ID = "d9_williams_r"
+
+
 def load_strategy() -> None:
+    """Force Williams %R as the permanent live strategy regardless of saved file."""
     global active_strategy_id
-    if not os.path.exists(STRATEGY_PATH):
-        log.info("No saved strategy at %s; using default", STRATEGY_PATH)
+    if FORCED_STRATEGY_ID not in STRATEGIES_BY_ID:
+        log.error("Forced strategy %s not in registry!", FORCED_STRATEGY_ID)
         return
-    try:
-        with open(STRATEGY_PATH) as f:
-            data = json.load(f)
-        sid = data.get("id")
-        if sid in STRATEGIES_BY_ID:
-            active_strategy_id = sid
-            log.info("Active strategy: %s (%s)", sid, STRATEGIES_BY_ID[sid].name)
-        else:
-            log.warning("Saved strategy %s not in registry; ignoring", sid)
-    except Exception as e:
-        log.warning("Failed to load strategy: %s", e)
+
+    saved_id = None
+    if os.path.exists(STRATEGY_PATH):
+        try:
+            with open(STRATEGY_PATH) as f:
+                saved_id = json.load(f).get("id")
+        except Exception as e:
+            log.warning("Failed to read %s: %s", STRATEGY_PATH, e)
+
+    active_strategy_id = FORCED_STRATEGY_ID
+    if saved_id != FORCED_STRATEGY_ID:
+        log.info(
+            "Forcing active strategy to Williams %%R (was %s); rewriting %s",
+            saved_id, STRATEGY_PATH,
+        )
+        save_strategy(FORCED_STRATEGY_ID, {
+            "name": STRATEGIES_BY_ID[FORCED_STRATEGY_ID].name,
+            "forced": True,
+            "opt_wr": 61.3, "opt_total": 6274,
+            "val_wr": 57.4, "val_total": 3009,
+        })
+    else:
+        log.info("Active strategy: Williams %%R (matches saved file)")
 
 
 def save_strategy(sid: str, meta: dict) -> None:
@@ -3573,7 +3652,7 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame | None =
 def handle_backtest_command(reply_to_message_id: int | None = None) -> None:
     log.info("Processing /backtest command")
     send_telegram(
-        "<b>Backtest started (backtesting.py engine)</b>\n"
+        "<b>Williams %R backtest started (backtesting.py engine)</b>\n"
         "Running BTCUSDT 6-month POC first. If Sharpe > 1.0 and Expectancy > 0, "
         "will expand to all 20 pairs. Otherwise stops and reports POC stats.",
         reply_to_message_id=reply_to_message_id,
@@ -3713,7 +3792,7 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
             return
 
         poc_msg = (
-            "<b>Library backtest POC: BTCUSDT</b>\n"
+            "<b>Williams %R backtest POC: BTCUSDT</b>\n"
             f"Range: {btc['start']} -> {btc['end']}\n"
             f"Trades: {btc['trades']}\n"
             f"Win Rate: {btc['wr']:.2f}%\n"
@@ -3775,7 +3854,7 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
         exp_avg = sum(r["expectancy"] for r in all_results) / len(all_results)
         ret_total = sum(r["ret"] for r in all_results)
 
-        lines = ["<b>20-pair library backtest complete</b>"]
+        lines = ["<b>Williams %R backtest: 20-pair results</b>"]
         lines.append("<pre>")
         lines.append(
             f"{'Pair':<10}{'T':>4}{'WR%':>7}{'Shrp':>7}{'DD%':>7}{'Exp%':>8}{'Ret%':>8}"
@@ -4117,12 +4196,13 @@ def main() -> None:
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
-        f"Watching {len(PAIRS)} pairs on {TIMEFRAME}.\n"
-        "Strategy: BbRsi (proven Freqtrade community mean reversion). "
-        f"LONG = RSI < {params['rsi_oversold']} AND close < lower BB. "
-        f"SHORT = RSI > {params['rsi_overbought']} AND close > upper BB.\n"
-        "TP at 2x ATR, SL at 1x ATR (2:1 reward:risk).\n"
-        f"Live params: {params_text()}\n"
+        "Active strategy: <b>Williams %R</b> (hardcoded permanent default).\n"
+        "LONG when W%R(14) crosses above -80 from below; "
+        "SHORT when W%R(14) crosses below -20 from above; "
+        "exit when W%R reaches -50 or ATR-based SL is hit.\n"
+        "Backtest: 61.3% WR on optimization (6274 trades), "
+        "57.4% WR on validation (3009 trades).\n"
+        f"Timeframe: {TIMEFRAME} across {len(PAIRS)} Binance Futures pairs.\n"
         f"{win_rate_text()}\n"
         f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
     )
