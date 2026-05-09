@@ -1203,6 +1203,528 @@ def _d2s25_sig(p, i):
 _register("e25_nvi", "Negative Volume Index", _d2s25_pre, _d2s25_sig, None, group="discover2")
 
 
+# 26. Positive Volume Index (mirror of NVI)
+def _d2s26_pre(df, ema_period=255):
+    n = len(df)
+    pvi = np.zeros(n)
+    pvi[0] = 1000
+    closes = df["close"].values
+    vols = df["volume"].values
+    for i in range(1, n):
+        if vols[i] > vols[i-1]:
+            pct = (closes[i] - closes[i-1]) / closes[i-1] if closes[i-1] != 0 else 0
+            pvi[i] = pvi[i-1] * (1 + pct)
+        else:
+            pvi[i] = pvi[i-1]
+    s = pd.Series(pvi, index=df.index)
+    return {"pvi": s, "pvi_ema": ema(s, ema_period)}
+def _d2s26_sig(p, i):
+    if i < 1: return None
+    pp = p["pvi"].iloc[i-1]; pc = p["pvi"].iloc[i]
+    ep = p["pvi_ema"].iloc[i-1]; ec = p["pvi_ema"].iloc[i]
+    if any(pd.isna(x) for x in (pp, pc, ep, ec)): return None
+    if pp <= ep and pc > ec: return "LONG"
+    if pp >= ep and pc < ec: return "SHORT"
+    return None
+_register("e26_pvi", "Positive Volume Index", _d2s26_pre, _d2s26_sig, None, group="discover2")
+
+
+# 27. Ulcer Index mean reversion
+def _d2s27_pre(df, period=14):
+    rolling_max = df["close"].rolling(period).max()
+    pct_dd = 100 * (df["close"] - rolling_max) / rolling_max.replace(0, np.nan)
+    sq = pct_dd ** 2
+    ui = np.sqrt(sq.rolling(period).mean())
+    return {"ui": ui, "rsi": rsi(df["close"], 14)}
+def _d2s27_sig(p, i):
+    if i < 5: return None
+    cur = p["ui"].iloc[i]
+    if pd.isna(cur) or cur >= 5: return None
+    spike = any(pd.notna(p["ui"].iloc[i-k]) and p["ui"].iloc[i-k] > 10 for k in range(1, 6))
+    if not spike: return None
+    return "LONG"
+def _d2s27_exit(p, i, d):
+    r = p["rsi"].iloc[i]
+    if pd.isna(r): return False
+    if d == "LONG" and r > 60: return f"RSI > 60 ({r:.1f})"
+    return False
+_register("e27_ulcer", "Ulcer Index Reversion", _d2s27_pre, _d2s27_sig, _d2s27_exit, group="discover2")
+
+
+# 28. Stochastic RSI crossover
+def _d2s28_pre(df):
+    rs = rsi(df["close"], 14)
+    rmin = rs.rolling(14).min()
+    rmax = rs.rolling(14).max()
+    rng = (rmax - rmin).replace(0, np.nan)
+    k_raw = 100 * (rs - rmin) / rng
+    k = k_raw.rolling(3).mean()
+    d = k.rolling(3).mean()
+    return {"srsi_k": k, "srsi_d": d}
+def _d2s28_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["srsi_k"].iloc[i-1], p["srsi_k"].iloc[i],
+                p["srsi_d"].iloc[i-1], p["srsi_d"].iloc[i], "up"):
+        if pd.notna(p["srsi_k"].iloc[i]) and p["srsi_k"].iloc[i] < 20: return "LONG"
+    if _crosses(p["srsi_k"].iloc[i-1], p["srsi_k"].iloc[i],
+                p["srsi_d"].iloc[i-1], p["srsi_d"].iloc[i], "down"):
+        if pd.notna(p["srsi_k"].iloc[i]) and p["srsi_k"].iloc[i] > 80: return "SHORT"
+    return None
+_register("e28_stoch_rsi", "Stochastic RSI Crossover", _d2s28_pre, _d2s28_sig, None, group="discover2")
+
+
+# 29. Fisher Transform
+def _d2s29_pre(df, period=10):
+    hl2 = (df["high"] + df["low"]) / 2
+    hh = hl2.rolling(period).max()
+    ll = hl2.rolling(period).min()
+    rng = (hh - ll).replace(0, np.nan)
+    raw = 2 * ((hl2 - ll) / rng - 0.5)
+    raw = raw.clip(-0.999, 0.999).fillna(0)
+    val = pd.Series(np.zeros(len(df)), index=df.index)
+    fish = pd.Series(np.zeros(len(df)), index=df.index)
+    rv = raw.values
+    vv = val.values; fv = fish.values
+    for i in range(1, len(df)):
+        vv[i] = 0.66 * rv[i] + 0.67 * vv[i-1]
+        vv[i] = max(min(vv[i], 0.999), -0.999)
+        fv[i] = 0.5 * np.log((1 + vv[i]) / (1 - vv[i])) + 0.5 * fv[i-1]
+    return {"fisher": pd.Series(fv, index=df.index)}
+def _d2s29_sig(p, i):
+    if i < 1: return None
+    pp = p["fisher"].iloc[i-1]; pc = p["fisher"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0 and pc > 0: return "LONG"
+    if pp >= 0 and pc < 0: return "SHORT"
+    return None
+_register("e29_fisher", "Fisher Transform", _d2s29_pre, _d2s29_sig, None, group="discover2")
+
+
+# 30. Schaff Trend Cycle (simplified: STC of MACD via double stoch)
+def _d2s30_pre(df, fast=23, slow=50, cycle=10):
+    macd_line = ema(df["close"], fast) - ema(df["close"], slow)
+    mmin = macd_line.rolling(cycle).min()
+    mmax = macd_line.rolling(cycle).max()
+    rng1 = (mmax - mmin).replace(0, np.nan)
+    pf = 100 * (macd_line - mmin) / rng1
+    pf_smooth = pf.ewm(alpha=0.5, adjust=False).mean()
+    pmin = pf_smooth.rolling(cycle).min()
+    pmax = pf_smooth.rolling(cycle).max()
+    rng2 = (pmax - pmin).replace(0, np.nan)
+    stc_raw = 100 * (pf_smooth - pmin) / rng2
+    stc = stc_raw.ewm(alpha=0.5, adjust=False).mean()
+    return {"stc": stc}
+def _d2s30_sig(p, i):
+    if i < 1: return None
+    pp = p["stc"].iloc[i-1]; pc = p["stc"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 25 and pc > 25: return "LONG"
+    if pp >= 75 and pc < 75: return "SHORT"
+    return None
+_register("e30_stc", "Schaff Trend Cycle", _d2s30_pre, _d2s30_sig, None, group="discover2")
+
+
+# 31. Ehlers Cybernetic cycle (approx via detrended sinewave)
+def _d2s31_pre(df, period=10):
+    detrended = df["close"] - ema(df["close"], period * 2)
+    cycle = pd.Series(np.zeros(len(df)), index=df.index)
+    cv = cycle.values
+    dv = detrended.values
+    for i in range(2, len(df)):
+        if np.isnan(dv[i]) or np.isnan(dv[i-1]) or np.isnan(dv[i-2]): continue
+        cv[i] = 0.5 * (dv[i] - dv[i-2]) + 0.5 * cv[i-1]
+    return {"cycle": pd.Series(cv, index=df.index)}
+def _d2s31_sig(p, i):
+    if i < 1: return None
+    pp = p["cycle"].iloc[i-1]; pc = p["cycle"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0 and pc > 0: return "LONG"
+    if pp >= 0 and pc < 0: return "SHORT"
+    return None
+_register("e31_cybernetic", "Ehlers Cybernetic Cycle", _d2s31_pre, _d2s31_sig, None, group="discover2")
+
+
+# 32. Zero Lag EMA crossover
+def _zlema(s, period):
+    lag = (period - 1) // 2
+    return ema(2 * s - s.shift(lag), period)
+def _d2s32_pre(df):
+    return {"z9": _zlema(df["close"], 9), "z21": _zlema(df["close"], 21)}
+def _d2s32_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["z9"].iloc[i-1], p["z9"].iloc[i], p["z21"].iloc[i-1], p["z21"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["z9"].iloc[i-1], p["z9"].iloc[i], p["z21"].iloc[i-1], p["z21"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e32_zlema", "ZLEMA Crossover", _d2s32_pre, _d2s32_sig, None, group="discover2")
+
+
+# 33. Hull MA crossover
+def _hma(s, period):
+    half = max(2, period // 2)
+    sqp = max(2, int(np.sqrt(period)))
+    return _wma(2 * _wma(s, half) - _wma(s, period), sqp)
+def _d2s33_pre(df):
+    return {"h9": _hma(df["close"], 9), "h21": _hma(df["close"], 21)}
+def _d2s33_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["h9"].iloc[i-1], p["h9"].iloc[i], p["h21"].iloc[i-1], p["h21"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["h9"].iloc[i-1], p["h9"].iloc[i], p["h21"].iloc[i-1], p["h21"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e33_hma", "Hull MA Crossover", _d2s33_pre, _d2s33_sig, None, group="discover2")
+
+
+# 34. DEMA crossover
+def _dema(s, period):
+    e = ema(s, period); ee = ema(e, period)
+    return 2 * e - ee
+def _d2s34_pre(df):
+    return {"d9": _dema(df["close"], 9), "d21": _dema(df["close"], 21)}
+def _d2s34_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["d9"].iloc[i-1], p["d9"].iloc[i], p["d21"].iloc[i-1], p["d21"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["d9"].iloc[i-1], p["d9"].iloc[i], p["d21"].iloc[i-1], p["d21"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e34_dema", "DEMA Crossover", _d2s34_pre, _d2s34_sig, None, group="discover2")
+
+
+# 35. TEMA crossover
+def _tema(s, period):
+    e = ema(s, period); ee = ema(e, period); eee = ema(ee, period)
+    return 3 * e - 3 * ee + eee
+def _d2s35_pre(df):
+    return {"t9": _tema(df["close"], 9), "t21": _tema(df["close"], 21)}
+def _d2s35_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["t9"].iloc[i-1], p["t9"].iloc[i], p["t21"].iloc[i-1], p["t21"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["t9"].iloc[i-1], p["t9"].iloc[i], p["t21"].iloc[i-1], p["t21"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e35_tema", "TEMA Crossover", _d2s35_pre, _d2s35_sig, None, group="discover2")
+
+
+# 36. Laguerre RSI (gamma 0.5)
+def _d2s36_pre(df, gamma=0.5):
+    n = len(df)
+    L0 = np.zeros(n); L1 = np.zeros(n); L2 = np.zeros(n); L3 = np.zeros(n)
+    cv = df["close"].values
+    lrsi = np.zeros(n)
+    for i in range(1, n):
+        L0[i] = (1 - gamma) * cv[i] + gamma * L0[i-1]
+        L1[i] = -gamma * L0[i] + L0[i-1] + gamma * L1[i-1]
+        L2[i] = -gamma * L1[i] + L1[i-1] + gamma * L2[i-1]
+        L3[i] = -gamma * L2[i] + L2[i-1] + gamma * L3[i-1]
+        cu = max(L0[i] - L1[i], 0) + max(L1[i] - L2[i], 0) + max(L2[i] - L3[i], 0)
+        cd = max(L1[i] - L0[i], 0) + max(L2[i] - L1[i], 0) + max(L3[i] - L2[i], 0)
+        lrsi[i] = cu / (cu + cd) if (cu + cd) > 0 else 0
+    return {"lrsi": pd.Series(lrsi, index=df.index)}
+def _d2s36_sig(p, i):
+    if i < 1: return None
+    pp = p["lrsi"].iloc[i-1]; pc = p["lrsi"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0.2 and pc > 0.2: return "LONG"
+    if pp >= 0.8 and pc < 0.8: return "SHORT"
+    return None
+_register("e36_laguerre_rsi", "Laguerre RSI", _d2s36_pre, _d2s36_sig, None, group="discover2")
+
+
+# 37. Rainbow oscillator
+def _d2s37_pre(df):
+    smas = [df["close"].rolling(p).mean() for p in range(2, 11)]
+    rainbow = sum(smas) / len(smas)
+    return {"rainbow": rainbow, "close": df["close"]}
+def _d2s37_sig(p, i):
+    if i < 1: return None
+    cp = p["close"].iloc[i-1]; cc = p["close"].iloc[i]
+    rp = p["rainbow"].iloc[i-1]; rc = p["rainbow"].iloc[i]
+    if any(pd.isna(x) for x in (cp, cc, rp, rc)): return None
+    if cp <= rp and cc > rc: return "LONG"
+    if cp >= rp and cc < rc: return "SHORT"
+    return None
+_register("e37_rainbow", "Rainbow Oscillator", _d2s37_pre, _d2s37_sig, None, group="discover2")
+
+
+# 38. Gann HiLo activator
+def _d2s38_pre(df):
+    return {
+        "sma_h": df["high"].rolling(3).mean(),
+        "sma_l": df["low"].rolling(3).mean(),
+        "close": df["close"],
+    }
+def _d2s38_sig(p, i):
+    if i < 1: return None
+    cp = p["close"].iloc[i-1]; cc = p["close"].iloc[i]
+    sh = p["sma_h"].iloc[i]; sl = p["sma_l"].iloc[i]
+    if any(pd.isna(x) for x in (cp, cc, sh, sl)): return None
+    if cp <= sh and cc > sh: return "LONG"
+    if cp >= sl and cc < sl: return "SHORT"
+    return None
+_register("e38_gann_hilo", "Gann HiLo Activator", _d2s38_pre, _d2s38_sig, None, group="discover2")
+
+
+# 39. VIDYA (CMO-adapted EMA)
+def _d2s39_pre(df, period=14):
+    diff = df["close"].diff()
+    up = diff.clip(lower=0).rolling(period).sum()
+    dn = (-diff.clip(upper=0)).rolling(period).sum()
+    cmo = ((up - dn) / (up + dn).replace(0, np.nan)).abs().fillna(0)
+    n = len(df); vidya = np.zeros(n); cv = df["close"].values; ad = cmo.values
+    alpha = 2 / (period + 1)
+    vidya[0] = cv[0]
+    for i in range(1, n):
+        a = alpha * ad[i] if not np.isnan(ad[i]) else alpha * 0.5
+        vidya[i] = a * cv[i] + (1 - a) * vidya[i-1]
+    return {"vidya": pd.Series(vidya, index=df.index), "rsi": rsi(df["close"], 14)}
+def _d2s39_sig(p, i):
+    if i < 1: return None
+    pp = p["vidya"].iloc[i-1]; pc = p["vidya"].iloc[i]
+    r = p["rsi"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc) or pd.isna(r): return None
+    if pc > pp and r < 55: return "LONG"
+    if pc < pp and r > 45: return "SHORT"
+    return None
+_register("e39_vidya", "VIDYA", _d2s39_pre, _d2s39_sig, None, group="discover2")
+
+
+# 40. FRAMA (fractal adaptive)
+def _d2s40_pre(df, period=16):
+    n = len(df); cv = df["close"].values
+    half = period // 2
+    frama = np.zeros(n); frama[:period] = cv[:period]
+    hv = df["high"].values; lv = df["low"].values
+    for i in range(period, n):
+        n1 = (np.max(hv[i-period:i-half]) - np.min(lv[i-period:i-half])) / half
+        n2 = (np.max(hv[i-half:i]) - np.min(lv[i-half:i])) / half
+        n3 = (np.max(hv[i-period:i]) - np.min(lv[i-period:i])) / period
+        if n1 > 0 and n2 > 0 and n3 > 0:
+            d = (np.log(n1 + n2) - np.log(n3)) / np.log(2)
+        else:
+            d = 1.5
+        alpha = max(0.01, min(1, np.exp(-4.6 * (d - 1))))
+        frama[i] = alpha * cv[i] + (1 - alpha) * frama[i-1]
+    return {"frama": pd.Series(frama, index=df.index), "close": df["close"]}
+def _d2s40_sig(p, i):
+    if i < 1: return None
+    cp = p["close"].iloc[i-1]; cc = p["close"].iloc[i]
+    fp = p["frama"].iloc[i-1]; fc = p["frama"].iloc[i]
+    if any(pd.isna(x) for x in (cp, cc, fp, fc)): return None
+    if cp <= fp and cc > fc: return "LONG"
+    if cp >= fp and cc < fc: return "SHORT"
+    return None
+_register("e40_frama", "FRAMA", _d2s40_pre, _d2s40_sig, None, group="discover2")
+
+
+# 41. McGinley Dynamic
+def _d2s41_pre(df, period=14):
+    n = len(df); md = np.zeros(n); cv = df["close"].values
+    md[0] = cv[0]
+    for i in range(1, n):
+        if md[i-1] == 0:
+            md[i] = cv[i]
+        else:
+            md[i] = md[i-1] + (cv[i] - md[i-1]) / (period * (cv[i] / md[i-1]) ** 4)
+    return {"md": pd.Series(md, index=df.index), "close": df["close"]}
+def _d2s41_sig(p, i):
+    if i < 1: return None
+    cp = p["close"].iloc[i-1]; cc = p["close"].iloc[i]
+    mp = p["md"].iloc[i-1]; mc = p["md"].iloc[i]
+    if any(pd.isna(x) for x in (cp, cc, mp, mc)): return None
+    if cp <= mp and cc > mc: return "LONG"
+    if cp >= mp and cc < mc: return "SHORT"
+    return None
+_register("e41_mcginley", "McGinley Dynamic", _d2s41_pre, _d2s41_sig, None, group="discover2")
+
+
+# 42. Ehlers Instantaneous Trendline (approx via WMA + smoothing)
+def _d2s42_pre(df, alpha=0.07):
+    n = len(df); cv = df["close"].values
+    it = np.zeros(n)
+    it[0] = cv[0]; it[1] = cv[1] if n > 1 else cv[0]
+    for i in range(2, n):
+        it[i] = (alpha - alpha**2/4) * cv[i] + 0.5 * alpha**2 * cv[i-1] - (alpha - 0.75 * alpha**2) * cv[i-2] + 2 * (1 - alpha) * it[i-1] - (1 - alpha)**2 * it[i-2]
+    return {"itrend": pd.Series(it, index=df.index), "close": df["close"]}
+def _d2s42_sig(p, i):
+    if i < 1: return None
+    cp = p["close"].iloc[i-1]; cc = p["close"].iloc[i]
+    tp = p["itrend"].iloc[i-1]; tc = p["itrend"].iloc[i]
+    if any(pd.isna(x) for x in (cp, cc, tp, tc)): return None
+    if cp <= tp and cc > tc: return "LONG"
+    if cp >= tp and cc < tc: return "SHORT"
+    return None
+_register("e42_itrend", "Ehlers Instantaneous Trendline", _d2s42_pre, _d2s42_sig, None, group="discover2")
+
+
+# 43. Sinewave (approx via cycle + 45-deg leading)
+def _d2s43_pre(df, period=10):
+    detr = df["close"] - df["close"].rolling(period).mean()
+    n = len(df)
+    sin_v = np.zeros(n); lead = np.zeros(n)
+    dv = detr.values
+    for i in range(period, n):
+        if np.isnan(dv[i]): continue
+        # Phase from arctan ratio of lagged values
+        try:
+            phase = np.arctan2(dv[i] - dv[i-period//4], dv[i] + 1e-9)
+        except Exception:
+            phase = 0
+        sin_v[i] = np.sin(phase)
+        lead[i] = np.sin(phase + np.pi / 4)
+    return {"sine": pd.Series(sin_v, index=df.index),
+            "lead": pd.Series(lead, index=df.index)}
+def _d2s43_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["sine"].iloc[i-1], p["sine"].iloc[i], p["lead"].iloc[i-1], p["lead"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["sine"].iloc[i-1], p["sine"].iloc[i], p["lead"].iloc[i-1], p["lead"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e43_sinewave", "Ehlers Sinewave", _d2s43_pre, _d2s43_sig, None, group="discover2")
+
+
+# 44. Even Better Sinewave
+def _d2s44_pre(df, period=20):
+    detr = df["close"] - df["close"].rolling(period).mean()
+    rms = np.sqrt((detr ** 2).rolling(period).mean()).replace(0, np.nan)
+    ebs = (detr / rms).fillna(0).clip(-2, 2) / 2
+    return {"ebs": ebs}
+def _d2s44_sig(p, i):
+    if i < 1: return None
+    pp = p["ebs"].iloc[i-1]; pc = p["ebs"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= -0.9 and pc > -0.9: return "LONG"
+    if pp >= 0.9 and pc < 0.9: return "SHORT"
+    return None
+_register("e44_ebs", "Even Better Sinewave", _d2s44_pre, _d2s44_sig, None, group="discover2")
+
+
+# 45. Recursive Median Filter
+def _d2s45_pre(df, period=5, alpha=0.3):
+    raw_med = df["close"].rolling(period).median()
+    n = len(df); rm = np.zeros(n); rv = raw_med.values; cv = df["close"].values
+    rm[0] = cv[0]
+    for i in range(1, n):
+        if np.isnan(rv[i]):
+            rm[i] = rm[i-1]
+        else:
+            rm[i] = alpha * rv[i] + (1 - alpha) * rm[i-1]
+    return {"rmedian": pd.Series(rm, index=df.index), "close": df["close"]}
+def _d2s45_sig(p, i):
+    if i < 1: return None
+    cp = p["close"].iloc[i-1]; cc = p["close"].iloc[i]
+    rp = p["rmedian"].iloc[i-1]; rc = p["rmedian"].iloc[i]
+    if any(pd.isna(x) for x in (cp, cc, rp, rc)): return None
+    if cp <= rp and cc > rc: return "LONG"
+    if cp >= rp and cc < rc: return "SHORT"
+    return None
+_register("e45_rec_median", "Recursive Median Filter", _d2s45_pre, _d2s45_sig, None, group="discover2")
+
+
+# 46. Volatility breakout
+def _d2s46_pre(df):
+    a = atr(df["high"], df["low"], df["close"], 14)
+    return {
+        "atr": a,
+        "trig_up": df["close"].shift(1) + 0.7 * a.shift(1),
+        "trig_dn": df["close"].shift(1) - 0.7 * a.shift(1),
+        "high": df["high"], "low": df["low"],
+    }
+def _d2s46_sig(p, i):
+    h = p["high"].iloc[i]; l = p["low"].iloc[i]
+    tu = p["trig_up"].iloc[i]; td = p["trig_dn"].iloc[i]
+    if any(pd.isna(x) for x in (h, l, tu, td)): return None
+    if h >= tu: return "LONG"
+    if l <= td: return "SHORT"
+    return None
+_register("e46_vol_breakout", "Volatility Breakout", _d2s46_pre, _d2s46_sig, None, group="discover2")
+
+
+# 47. Opening Range Breakout (24-bar windows on 1H)
+def _d2s47_pre(df, period=24):
+    group = pd.Series(np.arange(len(df)) // period, index=df.index)
+    first_high = df.groupby(group)["high"].transform("first")
+    first_low = df.groupby(group)["low"].transform("first")
+    bar_in_window = pd.Series(np.arange(len(df)) % period, index=df.index)
+    return {"fh": first_high, "fl": first_low, "bar": bar_in_window,
+            "close": df["close"]}
+def _d2s47_sig(p, i):
+    if p["bar"].iloc[i] == 0: return None  # don't trigger on first bar
+    c = p["close"].iloc[i]; fh = p["fh"].iloc[i]; fl = p["fl"].iloc[i]
+    if any(pd.isna(x) for x in (c, fh, fl)): return None
+    if c > fh: return "LONG"
+    if c < fl: return "SHORT"
+    return None
+def _d2s47_exit(p, i, d):
+    if p["bar"].iloc[i] == 23: return "End of UTC day"
+    return False
+_register("e47_orb", "Opening Range Breakout (24h)", _d2s47_pre, _d2s47_sig, _d2s47_exit, group="discover2")
+
+
+# 48. Three bar reversal
+def _d2s48_pre(df):
+    return {"open": df["open"], "close": df["close"]}
+def _d2s48_sig(p, i):
+    if i < 3: return None
+    o = p["open"]; c = p["close"]
+    o0, c0 = o.iloc[i-3], c.iloc[i-3]
+    o1, c1 = o.iloc[i-2], c.iloc[i-2]
+    o2, c2 = o.iloc[i-1], c.iloc[i-1]
+    o3, c3 = o.iloc[i], c.iloc[i]
+    if any(pd.isna(x) for x in (o0, c0, o1, c1, o2, c2, o3, c3)): return None
+    bear3 = c0 < o0 and c1 < o1 and c2 < o2
+    bull3 = c0 > o0 and c1 > o1 and c2 > o2
+    mid0 = (o0 + c0) / 2
+    if bear3 and c3 > o3 and c3 > mid0: return "LONG"
+    if bull3 and c3 < o3 and c3 < mid0: return "SHORT"
+    return None
+_register("e48_three_bar", "Three Bar Reversal", _d2s48_pre, _d2s48_sig, None, group="discover2")
+
+
+# 49. Inside bar breakout
+def _d2s49_pre(df):
+    return {"high": df["high"], "low": df["low"], "close": df["close"]}
+def _d2s49_sig(p, i):
+    if i < 2: return None
+    h = p["high"]; l = p["low"]; c = p["close"]
+    h0, l0 = h.iloc[i-2], l.iloc[i-2]
+    h1, l1 = h.iloc[i-1], l.iloc[i-1]
+    cc = c.iloc[i]; ch = h.iloc[i]; cl = l.iloc[i]
+    if any(pd.isna(x) for x in (h0, l0, h1, l1, cc, ch, cl)): return None
+    inside = h1 <= h0 and l1 >= l0
+    if not inside: return None
+    if ch > h1 and cc > h1: return "LONG"
+    if cl < l1 and cc < l1: return "SHORT"
+    return None
+_register("e49_inside_bar", "Inside Bar Breakout", _d2s49_pre, _d2s49_sig, None, group="discover2")
+
+
+# 50. Pivot point reversion (daily, 24-bar window)
+def _d2s50_pre(df, period=24):
+    group = pd.Series(np.arange(len(df)) // period, index=df.index)
+    prev_high = df.groupby(group)["high"].transform("max").shift(period)
+    prev_low = df.groupby(group)["low"].transform("min").shift(period)
+    prev_close = df["close"].shift(period)
+    pivot = (prev_high + prev_low + prev_close) / 3
+    s1 = 2 * pivot - prev_high
+    r1 = 2 * pivot - prev_low
+    return {"pivot": pivot, "s1": s1, "r1": r1, "rsi": rsi(df["close"], 14),
+            "low": df["low"], "high": df["high"]}
+def _d2s50_sig(p, i):
+    lo = p["low"].iloc[i]; hi = p["high"].iloc[i]
+    s1 = p["s1"].iloc[i]; r1 = p["r1"].iloc[i]
+    r = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (lo, hi, s1, r1, r)): return None
+    if lo <= s1 and r < 40: return "LONG"
+    if hi >= r1 and r > 60: return "SHORT"
+    return None
+_register("e50_pivot_rev", "Pivot Point Reversion", _d2s50_pre, _d2s50_sig, None, group="discover2")
+
+
 def handle_discover2_command(reply_to_message_id: int | None = None) -> None:
     global discover_running
     with discover_lock:
