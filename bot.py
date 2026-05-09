@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import logging
 from datetime import datetime, timezone, timedelta
@@ -36,6 +37,48 @@ last_signal_by_pair: dict[str, str] = {}
 open_positions: dict[str, str] = {}
 position_entry_price: dict[str, float] = {}
 trade_results: list[bool] = []
+
+STATE_PATH = os.environ.get(
+    "STATE_PATH",
+    "/data/state.json" if os.path.isdir("/data") else "state.json",
+)
+
+
+def load_state() -> None:
+    if not os.path.exists(STATE_PATH):
+        log.info("No prior state at %s; starting fresh", STATE_PATH)
+        return
+    try:
+        with open(STATE_PATH) as f:
+            data = json.load(f)
+        trade_results[:] = list(data.get("trade_results", []))
+        open_positions.update(data.get("open_positions", {}))
+        position_entry_price.update(data.get("position_entry_price", {}))
+        last_signal_by_pair.update(data.get("last_signal_by_pair", {}))
+        log.info(
+            "Loaded state: %d trades, %d open positions",
+            len(trade_results), len(open_positions),
+        )
+    except Exception as e:
+        log.warning("Failed to load state from %s: %s", STATE_PATH, e)
+
+
+def save_state() -> None:
+    try:
+        parent = os.path.dirname(STATE_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({
+                "trade_results": trade_results,
+                "open_positions": open_positions,
+                "position_entry_price": position_entry_price,
+                "last_signal_by_pair": last_signal_by_pair,
+            }, f)
+        os.replace(tmp, STATE_PATH)
+    except Exception as e:
+        log.warning("Failed to save state to %s: %s", STATE_PATH, e)
 
 
 def win_rate_text() -> str:
@@ -253,6 +296,7 @@ def scan_once() -> None:
                     if entry is not None:
                         trade_results.append(result["price"] > entry)
                     open_positions.pop(symbol, None)
+                    save_state()
                     log.info("%s: CLOSE LONG sent (%s)", symbol, "; ".join(reasons))
             elif position == "SHORT":
                 reasons = check_short_exit(result)
@@ -262,6 +306,7 @@ def scan_once() -> None:
                     if entry is not None:
                         trade_results.append(result["price"] < entry)
                     open_positions.pop(symbol, None)
+                    save_state()
                     log.info("%s: CLOSE SHORT sent (%s)", symbol, "; ".join(reasons))
 
             direction = result["direction"]
@@ -273,6 +318,7 @@ def scan_once() -> None:
             last_signal_by_pair[symbol] = direction
             open_positions[symbol] = direction
             position_entry_price[symbol] = result["price"]
+            save_state()
             msg = format_message(symbol, result)
             send_telegram(msg)
             log.info("%s: %s signal sent", symbol, direction)
@@ -284,7 +330,8 @@ def scan_once() -> None:
 
 
 def main() -> None:
-    log.info("binance-signal-bot starting")
+    log.info("binance-signal-bot starting (state path: %s)", STATE_PATH)
+    load_state()
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
         f"Watching {len(PAIRS)} pairs on {TIMEFRAME}.\n"
