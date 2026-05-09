@@ -315,54 +315,69 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     obv_line = obv(close, volume)
     obv_ema = ema(obv_line, 20)
     atr14 = atr(high, low, close, 14)
-    volume_sma20 = volume.rolling(window=20).mean()
 
-    price = close.iloc[-1]
-    low_now, low_prev = low.iloc[-1], low.iloc[-2]
-    high_now, high_prev = high.iloc[-1], high.iloc[-2]
-    rsi_now, rsi_prev = rsi14.iloc[-1], rsi14.iloc[-2]
+    price = float(close.iloc[-1])
+    rsi_now = rsi14.iloc[-1]
+    rsi_prev1 = rsi14.iloc[-2] if len(rsi14) >= 2 else float("nan")
+    rsi_prev2 = rsi14.iloc[-3] if len(rsi14) >= 3 else float("nan")
     bb_upper_now = bb_upper.iloc[-1]
-    bb_upper_prev = bb_upper.iloc[-2]
     bb_lower_now = bb_lower.iloc[-1]
-    bb_lower_prev = bb_lower.iloc[-2]
     bb_middle_now = bb_middle.iloc[-1]
     slope_now = ema50_slope.iloc[-1]
     obv_now = obv_line.iloc[-1]
     obv_ema_now = obv_ema.iloc[-1]
     atr_now = atr14.iloc[-1]
-    vol_now = volume.iloc[-1]
-    vol_sma_now = volume_sma20.iloc[-1]
 
-    rsi_oversold = params["rsi_oversold"]
-    rsi_overbought = params["rsi_overbought"]
-
-    rsi_long_revert = (rsi_now < rsi_oversold or rsi_prev < rsi_oversold) and rsi_now > rsi_prev
-    rsi_short_revert = (rsi_now > rsi_overbought or rsi_prev > rsi_overbought) and rsi_now < rsi_prev
-
-    bb_long_touch = pd.notna(bb_lower_now) and pd.notna(bb_lower_prev) and (
-        (low_now <= bb_lower_now or low_prev <= bb_lower_prev) and price > bb_lower_now
+    recent_rsi_low = any(
+        pd.notna(rsi14.iloc[-i]) and rsi14.iloc[-i] < 30 for i in (1, 2, 3) if len(rsi14) >= i
     )
-    bb_short_touch = pd.notna(bb_upper_now) and pd.notna(bb_upper_prev) and (
-        (high_now >= bb_upper_now or high_prev >= bb_upper_prev) and price < bb_upper_now
+    recent_rsi_high = any(
+        pd.notna(rsi14.iloc[-i]) and rsi14.iloc[-i] > 70 for i in (1, 2, 3) if len(rsi14) >= i
     )
+    recent_bb_long_touch = any(
+        pd.notna(low.iloc[-i]) and pd.notna(bb_lower.iloc[-i]) and low.iloc[-i] <= bb_lower.iloc[-i]
+        for i in (1, 2, 3) if len(low) >= i
+    )
+    recent_bb_short_touch = any(
+        pd.notna(high.iloc[-i]) and pd.notna(bb_upper.iloc[-i]) and high.iloc[-i] >= bb_upper.iloc[-i]
+        for i in (1, 2, 3) if len(high) >= i
+    )
+
+    near_lower = (
+        pd.notna(bb_lower_now)
+        and abs(price - float(bb_lower_now)) <= 0.005 * price
+    )
+    near_upper = (
+        pd.notna(bb_upper_now)
+        and abs(price - float(bb_upper_now)) <= 0.005 * price
+    )
+
+    c1_long = bool((pd.notna(rsi_now) and rsi_now < 35) or recent_rsi_low)
+    c2_long = bool(near_lower or recent_bb_long_touch)
+    c3_long = bool(obv_now > obv_ema_now)
+    c4_long = bool(pd.notna(slope_now) and slope_now > -0.005 * price)
+
+    c1_short = bool((pd.notna(rsi_now) and rsi_now > 65) or recent_rsi_high)
+    c2_short = bool(near_upper or recent_bb_short_touch)
+    c3_short = bool(obv_now < obv_ema_now)
+    c4_short = bool(pd.notna(slope_now) and slope_now < 0.005 * price)
+
+    long_count = sum([c1_long, c2_long, c3_long, c4_long])
+    short_count = sum([c1_short, c2_short, c3_short, c4_short])
+
+    direction = None
+    if long_count >= 3 and long_count >= short_count:
+        direction = "LONG"
+    elif short_count >= 3:
+        direction = "SHORT"
 
     obv_bull = obv_now > obv_ema_now
     obv_bear = obv_now < obv_ema_now
 
-    volume_ok = bool(pd.notna(vol_sma_now) and vol_now >= params["volume_mult"] * vol_sma_now)
-    slope_long_ok = bool(pd.notna(slope_now) and slope_now >= 0)
-    slope_short_ok = bool(pd.notna(slope_now) and slope_now <= 0)
-
-    direction = None
-    if rsi_long_revert and bb_long_touch and obv_bull and volume_ok and slope_long_ok:
-        direction = "LONG"
-    elif rsi_short_revert and bb_short_touch and obv_bear and volume_ok and slope_short_ok:
-        direction = "SHORT"
-
     return {
         "direction": direction,
-        "price": float(price),
-        "rsi": float(rsi_now),
+        "price": price,
+        "rsi": float(rsi_now) if pd.notna(rsi_now) else 0.0,
         "bb_upper": float(bb_upper_now) if pd.notna(bb_upper_now) else 0.0,
         "bb_middle": float(bb_middle_now) if pd.notna(bb_middle_now) else 0.0,
         "bb_lower": float(bb_lower_now) if pd.notna(bb_lower_now) else 0.0,
@@ -373,7 +388,6 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
         "obv_bull": bool(obv_bull),
         "obv_bear": bool(obv_bear),
         "atr": float(atr_now),
-        "volume_ok": volume_ok,
         "candle_time": df["close_time"].iloc[-1],
     }
 
@@ -578,9 +592,6 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
     atr14 = precomp["atr14"]
     vol_sma20 = precomp["vol_sma20"]
 
-    rsi_oversold = sim_params["rsi_oversold"]
-    rsi_overbought = sim_params["rsi_overbought"]
-    vol_mult = sim_params["volume_mult"]
     sl_mult = sim_params["sl_mult"]
     tp_mult = sim_params["tp_mult"]
     tp_hit_rr = tp_mult / sl_mult
@@ -593,6 +604,10 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
         "conditions_met_sum": 0,
         "rejected_by_4h_only": 0,
         "fired_conditions_sum": 0,
+        "fired_c1": 0,
+        "fired_c2": 0,
+        "fired_c3": 0,
+        "fired_c4": 0,
     }
 
     start_idx = 60
@@ -654,17 +669,13 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
             continue
 
         atr_cur = float(atr14.iloc[i])
-        vol_cur = float(volume.iloc[i])
-        vol_sma_cur = float(vol_sma20.iloc[i]) if pd.notna(vol_sma20.iloc[i]) else float("nan")
 
-        if pd.isna(atr_cur) or pd.isna(vol_sma_cur):
+        if pd.isna(atr_cur):
             continue
 
         bb_upper_cur = float(bb_upper.iloc[i]) if pd.notna(bb_upper.iloc[i]) else float("nan")
         bb_lower_cur = float(bb_lower.iloc[i]) if pd.notna(bb_lower.iloc[i]) else float("nan")
-        bb_upper_pr = float(bb_upper.iloc[i - 1]) if pd.notna(bb_upper.iloc[i - 1]) else float("nan")
-        bb_lower_pr = float(bb_lower.iloc[i - 1]) if pd.notna(bb_lower.iloc[i - 1]) else float("nan")
-        if pd.isna(bb_upper_cur) or pd.isna(bb_lower_cur) or pd.isna(bb_upper_pr) or pd.isna(bb_lower_pr):
+        if pd.isna(bb_upper_cur) or pd.isna(bb_lower_cur):
             continue
 
         ema50_cur = float(ema50.iloc[i])
@@ -673,54 +684,89 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
             continue
         slope = ema50_cur - ema50_back
 
-        rsi_cur = float(rsi14.iloc[i]); rsi_pr = float(rsi14.iloc[i - 1])
-        l_pr = float(low_arr.iloc[i - 1])
-        h_pr = float(high_arr.iloc[i - 1])
+        rsi_cur = float(rsi14.iloc[i])
+        rsi_recent_low = any(
+            i - k >= 0 and pd.notna(rsi14.iloc[i - k]) and rsi14.iloc[i - k] < 30
+            for k in (0, 1, 2)
+        )
+        rsi_recent_high = any(
+            i - k >= 0 and pd.notna(rsi14.iloc[i - k]) and rsi14.iloc[i - k] > 70
+            for k in (0, 1, 2)
+        )
 
-        rsi_long_revert = (rsi_cur < rsi_oversold or rsi_pr < rsi_oversold) and rsi_cur > rsi_pr
-        rsi_short_revert = (rsi_cur > rsi_overbought or rsi_pr > rsi_overbought) and rsi_cur < rsi_pr
-        bb_long_touch = (l <= bb_lower_cur or l_pr <= bb_lower_pr) and c > bb_lower_cur
-        bb_short_touch = (h >= bb_upper_cur or h_pr >= bb_upper_pr) and c < bb_upper_cur
+        bb_long_touch_recent = any(
+            i - k >= 0
+            and pd.notna(low_arr.iloc[i - k]) and pd.notna(bb_lower.iloc[i - k])
+            and low_arr.iloc[i - k] <= bb_lower.iloc[i - k]
+            for k in (0, 1, 2)
+        )
+        bb_short_touch_recent = any(
+            i - k >= 0
+            and pd.notna(high_arr.iloc[i - k]) and pd.notna(bb_upper.iloc[i - k])
+            and high_arr.iloc[i - k] >= bb_upper.iloc[i - k]
+            for k in (0, 1, 2)
+        )
+        near_lower = abs(c - bb_lower_cur) <= 0.005 * c
+        near_upper = abs(c - bb_upper_cur) <= 0.005 * c
 
-        obv_cur = float(obv_line.iloc[i]); obv_ema_cur = float(obv_ema_v.iloc[i])
-        obv_bull = obv_cur > obv_ema_cur
-        obv_bear = obv_cur < obv_ema_cur
-        volume_ok = vol_cur >= vol_mult * vol_sma_cur
-        slope_long = slope >= 0
-        slope_short = slope <= 0
+        obv_cur = float(obv_line.iloc[i])
+        obv_ema_cur = float(obv_ema_v.iloc[i])
 
-        c_long = [rsi_long_revert, bb_long_touch, obv_bull, volume_ok, slope_long]
-        c_short = [rsi_short_revert, bb_short_touch, obv_bear, volume_ok, slope_short]
-        long_count = sum(c_long)
-        short_count = sum(c_short)
+        c1_long = (rsi_cur < 35) or rsi_recent_low
+        c2_long = near_lower or bb_long_touch_recent
+        c3_long = obv_cur > obv_ema_cur
+        c4_long = slope > -0.005 * c
+
+        c1_short = (rsi_cur > 65) or rsi_recent_high
+        c2_short = near_upper or bb_short_touch_recent
+        c3_short = obv_cur < obv_ema_cur
+        c4_short = slope < 0.005 * c
+
+        long_arr = [c1_long, c2_long, c3_long, c4_long]
+        short_arr = [c1_short, c2_short, c3_short, c4_short]
+        long_count = sum(long_arr)
+        short_count = sum(short_arr)
         debug["candles_evaluated"] += 1
         debug["conditions_met_sum"] += max(long_count, short_count)
 
-        if all(c_long):
+        long_fires = long_count >= 3 and long_count >= short_count
+        short_fires = (not long_fires) and short_count >= 3
+
+        if long_fires:
             risk = sl_mult * atr_cur
             open_pos = {
                 "direction": "LONG", "entry": c,
                 "tp": c + tp_mult * atr_cur, "sl": c - sl_mult * atr_cur, "risk": risk,
             }
             debug["fired_conditions_sum"] += long_count
+            if c1_long: debug["fired_c1"] += 1
+            if c2_long: debug["fired_c2"] += 1
+            if c3_long: debug["fired_c3"] += 1
+            if c4_long: debug["fired_c4"] += 1
             if log_entries:
                 log.info(
-                    "backtest %s LONG entry @ %.6g | rsi=%.2f bb_low=%.6g vol=%.2fx slope=%+.6g",
-                    symbol, c, rsi_cur, bb_lower_cur,
-                    vol_cur / vol_sma_cur if vol_sma_cur else 0.0, slope,
+                    "backtest %s LONG entry @ %.6g | rsi=%.2f bb_low=%.6g slope=%+.6g | "
+                    "c1=%s c2=%s c3=%s c4=%s",
+                    symbol, c, rsi_cur, bb_lower_cur, slope,
+                    c1_long, c2_long, c3_long, c4_long,
                 )
-        elif all(c_short):
+        elif short_fires:
             risk = sl_mult * atr_cur
             open_pos = {
                 "direction": "SHORT", "entry": c,
                 "tp": c - tp_mult * atr_cur, "sl": c + sl_mult * atr_cur, "risk": risk,
             }
             debug["fired_conditions_sum"] += short_count
+            if c1_short: debug["fired_c1"] += 1
+            if c2_short: debug["fired_c2"] += 1
+            if c3_short: debug["fired_c3"] += 1
+            if c4_short: debug["fired_c4"] += 1
             if log_entries:
                 log.info(
-                    "backtest %s SHORT entry @ %.6g | rsi=%.2f bb_up=%.6g vol=%.2fx slope=%+.6g",
-                    symbol, c, rsi_cur, bb_upper_cur,
-                    vol_cur / vol_sma_cur if vol_sma_cur else 0.0, slope,
+                    "backtest %s SHORT entry @ %.6g | rsi=%.2f bb_up=%.6g slope=%+.6g | "
+                    "c1=%s c2=%s c3=%s c4=%s",
+                    symbol, c, rsi_cur, bb_upper_cur, slope,
+                    c1_short, c2_short, c3_short, c4_short,
                 )
 
     return trades, debug
@@ -757,6 +803,10 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
             "conditions_met_sum": 0,
             "rejected_by_4h_only": 0,
             "fired_conditions_sum": 0,
+            "fired_c1": 0,
+            "fired_c2": 0,
+            "fired_c3": 0,
+            "fired_c4": 0,
         }
         for symbol in PAIRS:
             try:
@@ -824,9 +874,16 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
             agg_debug["conditions_met_sum"] / agg_debug["candles_evaluated"]
             if agg_debug["candles_evaluated"] else 0.0
         )
-        lines.append(f"Avg conditions met per fired signal: {avg_fired:.2f} / 5")
-        lines.append(f"Avg conditions met per evaluated candle: {avg_evaluated:.2f} / 5")
+        lines.append(f"Avg conditions met per fired signal: {avg_fired:.2f} / 4")
+        lines.append(f"Avg conditions met per evaluated candle: {avg_evaluated:.2f} / 4")
         lines.append(f"Candles evaluated for entry: {agg_debug['candles_evaluated']:,}")
+        lines.append(
+            f"Per-condition fires across {total_t} entries: "
+            f"c1 RSI extreme {agg_debug['fired_c1']}, "
+            f"c2 BB touch/near {agg_debug['fired_c2']}, "
+            f"c3 OBV aligned {agg_debug['fired_c3']}, "
+            f"c4 slope OK {agg_debug['fired_c4']}"
+        )
 
         lines.append("")
         lines.append("<i>Past performance does not guarantee future results.</i>")
