@@ -191,6 +191,33 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
+def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=high.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=high.index,
+    )
+
+    alpha = 1 / period
+    atr_w = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_w.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_w.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=alpha, adjust=False).mean()
+
+
 _4h_trend_cache: dict[str, str] = {}
 _cache_lock = threading.Lock()
 
@@ -220,6 +247,7 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     obv_line = obv(close, volume)
     obv_ema = ema(obv_line, 20)
     atr14 = atr(high, low, close, 14)
+    adx14 = compute_adx(high, low, close, 14)
     volume_sma20 = volume.rolling(window=20).mean()
 
     price = close.iloc[-1]
@@ -231,6 +259,7 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     obv_now = obv_line.iloc[-1]
     obv_ema_now = obv_ema.iloc[-1]
     atr_now = atr14.iloc[-1]
+    adx_now = adx14.iloc[-1]
     vol_now = volume.iloc[-1]
     vol_sma_now = volume_sma20.iloc[-1]
 
@@ -249,6 +278,7 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     obv_bear = obv_now < obv_ema_now
 
     volume_ok = bool(pd.notna(vol_sma_now) and vol_now >= 1.2 * vol_sma_now)
+    adx_ok = bool(pd.notna(adx_now) and adx_now >= 25)
 
     trend_4h = get_4h_trend(symbol)
 
@@ -261,6 +291,7 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
         and rsi_long_ok
         and obv_bull
         and volume_ok
+        and adx_ok
     ):
         direction = "LONG"
     elif (
@@ -271,6 +302,7 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
         and rsi_short_ok
         and obv_bear
         and volume_ok
+        and adx_ok
     ):
         direction = "SHORT"
 
@@ -285,6 +317,7 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
         "obv_ema": float(obv_ema_now),
         "obv_trend": "bullish" if obv_bull else ("bearish" if obv_bear else "flat"),
         "atr": float(atr_now),
+        "adx": float(adx_now) if pd.notna(adx_now) else 0.0,
         "macd_cross_up": bool(macd_cross_up),
         "macd_cross_down": bool(macd_cross_down),
         "obv_bull": bool(obv_bull),
@@ -301,10 +334,10 @@ def format_message(symbol: str, r: dict) -> str:
     atr_v = r["atr"]
     if r["direction"] == "LONG":
         tp = price + 3 * atr_v
-        sl = price - 1.5 * atr_v
+        sl = price - 2 * atr_v
     else:
         tp = price - 3 * atr_v
-        sl = price + 1.5 * atr_v
+        sl = price + 2 * atr_v
     return (
         f"<b>{r['direction']} signal: {symbol}</b>\n"
         f"Timeframe: {TIMEFRAME}\n"
@@ -447,6 +480,7 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tupl
     obv_line = obv(close, volume)
     obv_ema_v = ema(obv_line, 20)
     atr14 = atr(high_arr, low_arr, close, 14)
+    adx14 = compute_adx(high_arr, low_arr, close, 14)
     vol_sma20 = volume.rolling(window=20).mean()
 
     ema100_4h_full = ema(df_4h["close"], 100)
@@ -487,7 +521,7 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tupl
                 open_pos = None
                 continue
             if tp_hit:
-                trades.append({"direction": d, "entry": entry, "exit": tp, "rr": 2.0, "result": "win"})
+                trades.append({"direction": d, "entry": entry, "exit": tp, "rr": 1.5, "result": "win"})
                 open_pos = None
                 continue
 
@@ -518,10 +552,11 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tupl
         ema100_now = float(ema100_1h.iloc[i])
         ema100_4h_now = ema100_4h_aligned[i]
         atr_cur = float(atr14.iloc[i])
+        adx_cur = float(adx14.iloc[i]) if pd.notna(adx14.iloc[i]) else float("nan")
         vol_cur = float(volume.iloc[i])
         vol_sma_cur = float(vol_sma20.iloc[i]) if pd.notna(vol_sma20.iloc[i]) else float("nan")
 
-        if pd.isna(ema100_4h_now) or pd.isna(atr_cur) or pd.isna(vol_sma_cur):
+        if pd.isna(ema100_4h_now) or pd.isna(atr_cur) or pd.isna(vol_sma_cur) or pd.isna(adx_cur):
             continue
 
         macd_cur = float(macd_line.iloc[i]); macd_pr = float(macd_line.iloc[i - 1])
@@ -546,10 +581,11 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tupl
         trend_up = c > ema4h
         trend_down = c < ema4h
 
+        adx_ok = adx_cur >= 25
         c_long = [c > ema100_now, trend_up, cross_up, hist_growing_up,
-                  rsi_long_ok, obv_bull, volume_ok]
+                  rsi_long_ok, obv_bull, volume_ok, adx_ok]
         c_short = [c < ema100_now, trend_down, cross_down, hist_growing_down,
-                   rsi_short_ok, obv_bear, volume_ok]
+                   rsi_short_ok, obv_bear, volume_ok, adx_ok]
         long_count = sum(c_long)
         short_count = sum(c_short)
         debug["candles_evaluated"] += 1
@@ -561,28 +597,30 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tupl
             debug["rejected_by_4h_only"] += 1
 
         if all(c_long):
-            risk = 1.5 * atr_cur
+            risk = 2 * atr_cur
             open_pos = {
                 "direction": "LONG", "entry": c,
-                "tp": c + 3 * atr_cur, "sl": c - 1.5 * atr_cur, "risk": risk,
+                "tp": c + 3 * atr_cur, "sl": c - 2 * atr_cur, "risk": risk,
             }
             debug["fired_conditions_sum"] += long_count
             log.info(
                 "backtest %s LONG entry @ %.6g | ema1h=Y trend4h=up(price=%.6g vs ema4h=%.6g) "
-                "macd_cross=Y hist_grow=Y rsi=%.2f obv=bull vol=%.2fx",
-                symbol, c, c, ema4h, rsi_cur, vol_cur / vol_sma_cur if vol_sma_cur else 0.0,
+                "macd_cross=Y hist_grow=Y rsi=%.2f obv=bull vol=%.2fx adx=%.2f",
+                symbol, c, c, ema4h, rsi_cur,
+                vol_cur / vol_sma_cur if vol_sma_cur else 0.0, adx_cur,
             )
         elif all(c_short):
-            risk = 1.5 * atr_cur
+            risk = 2 * atr_cur
             open_pos = {
                 "direction": "SHORT", "entry": c,
-                "tp": c - 3 * atr_cur, "sl": c + 1.5 * atr_cur, "risk": risk,
+                "tp": c - 3 * atr_cur, "sl": c + 2 * atr_cur, "risk": risk,
             }
             debug["fired_conditions_sum"] += short_count
             log.info(
                 "backtest %s SHORT entry @ %.6g | ema1h=Y trend4h=down(price=%.6g vs ema4h=%.6g) "
-                "macd_cross=Y hist_grow=Y rsi=%.2f obv=bear vol=%.2fx",
-                symbol, c, c, ema4h, rsi_cur, vol_cur / vol_sma_cur if vol_sma_cur else 0.0,
+                "macd_cross=Y hist_grow=Y rsi=%.2f obv=bear vol=%.2fx adx=%.2f",
+                symbol, c, c, ema4h, rsi_cur,
+                vol_cur / vol_sma_cur if vol_sma_cur else 0.0, adx_cur,
             )
 
     return trades, debug
@@ -639,7 +677,7 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
                 })
                 log.info(
                     "backtest %s: %d trades, %.1f%% WR, avg RR %+.2f | "
-                    "candles=%d, avg_conds=%.2f/7, 4h_rejections=%d",
+                    "candles=%d, avg_conds=%.2f/8, 4h_rejections=%d",
                     symbol, total, wr, avg_rr,
                     debug["candles_evaluated"],
                     debug["conditions_met_sum"] / debug["candles_evaluated"]
@@ -682,8 +720,8 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
             agg_debug["conditions_met_sum"] / agg_debug["candles_evaluated"]
             if agg_debug["candles_evaluated"] else 0.0
         )
-        lines.append(f"Avg conditions met per fired signal: {avg_fired:.2f} / 7")
-        lines.append(f"Avg conditions met per evaluated candle: {avg_evaluated:.2f} / 7")
+        lines.append(f"Avg conditions met per fired signal: {avg_fired:.2f} / 8")
+        lines.append(f"Avg conditions met per evaluated candle: {avg_evaluated:.2f} / 8")
         lines.append(f"Candles evaluated for entry: {agg_debug['candles_evaluated']:,}")
         lines.append(f"Trades rejected by 4H filter alone: {agg_debug['rejected_by_4h_only']:,}")
 
@@ -817,8 +855,8 @@ def main() -> None:
         "<b>binance-signal-bot online</b>\n"
         f"Watching {len(PAIRS)} pairs on {TIMEFRAME}.\n"
         "Strategy: 4H trend confirmation + 1H entry timing "
-        "(EMA100 + RSI + MACD + OBV + volume spike).\n"
-        "Targeting 58-68% win rate at 2:1 reward:risk.\n"
+        "(EMA100 + RSI + MACD + OBV + volume spike + ADX>25).\n"
+        "TP at 3x ATR, SL at 2x ATR (1.5:1 reward:risk).\n"
         f"{win_rate_text()}\n"
         f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
     )
