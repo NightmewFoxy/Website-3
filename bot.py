@@ -336,40 +336,43 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     )
     recent_bb_long_touch = any(
         pd.notna(low.iloc[-i]) and pd.notna(bb_lower.iloc[-i]) and low.iloc[-i] <= bb_lower.iloc[-i]
-        for i in (1, 2, 3) if len(low) >= i
+        for i in (1, 2) if len(low) >= i
     )
     recent_bb_short_touch = any(
         pd.notna(high.iloc[-i]) and pd.notna(bb_upper.iloc[-i]) and high.iloc[-i] >= bb_upper.iloc[-i]
-        for i in (1, 2, 3) if len(high) >= i
+        for i in (1, 2) if len(high) >= i
     )
 
     near_lower = (
         pd.notna(bb_lower_now)
-        and abs(price - float(bb_lower_now)) <= 0.005 * price
+        and abs(price - float(bb_lower_now)) <= 0.002 * price
     )
     near_upper = (
         pd.notna(bb_upper_now)
-        and abs(price - float(bb_upper_now)) <= 0.005 * price
+        and abs(price - float(bb_upper_now)) <= 0.002 * price
     )
+    slope_flat = pd.notna(slope_now) and abs(float(slope_now)) < 0.003 * price
+    atr_ok = pd.notna(atr_now) and float(atr_now) >= 0.003 * price
 
     c1_long = bool((pd.notna(rsi_now) and rsi_now < 35) or recent_rsi_low)
     c2_long = bool(near_lower or recent_bb_long_touch)
     c3_long = bool(obv_now > obv_ema_now)
-    c4_long = bool(pd.notna(slope_now) and slope_now > -0.005 * price)
+    c4_long = bool(slope_flat)
 
     c1_short = bool((pd.notna(rsi_now) and rsi_now > 65) or recent_rsi_high)
     c2_short = bool(near_upper or recent_bb_short_touch)
     c3_short = bool(obv_now < obv_ema_now)
-    c4_short = bool(pd.notna(slope_now) and slope_now < 0.005 * price)
+    c4_short = bool(slope_flat)
 
     long_count = sum([c1_long, c2_long, c3_long, c4_long])
     short_count = sum([c1_short, c2_short, c3_short, c4_short])
 
     direction = None
-    if long_count >= 3 and long_count >= short_count:
-        direction = "LONG"
-    elif short_count >= 3:
-        direction = "SHORT"
+    if atr_ok:
+        if long_count == 4 and long_count >= short_count:
+            direction = "LONG"
+        elif short_count == 4:
+            direction = "SHORT"
 
     obv_bull = obv_now > obv_ema_now
     obv_bear = obv_now < obv_ema_now
@@ -608,6 +611,11 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
         "fired_c2": 0,
         "fired_c3": 0,
         "fired_c4": 0,
+        "eval_c1": 0,
+        "eval_c2": 0,
+        "eval_c3": 0,
+        "eval_c4": 0,
+        "atr_too_low": 0,
     }
 
     start_idx = 60
@@ -698,29 +706,32 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
             i - k >= 0
             and pd.notna(low_arr.iloc[i - k]) and pd.notna(bb_lower.iloc[i - k])
             and low_arr.iloc[i - k] <= bb_lower.iloc[i - k]
-            for k in (0, 1, 2)
+            for k in (0, 1)
         )
         bb_short_touch_recent = any(
             i - k >= 0
             and pd.notna(high_arr.iloc[i - k]) and pd.notna(bb_upper.iloc[i - k])
             and high_arr.iloc[i - k] >= bb_upper.iloc[i - k]
-            for k in (0, 1, 2)
+            for k in (0, 1)
         )
-        near_lower = abs(c - bb_lower_cur) <= 0.005 * c
-        near_upper = abs(c - bb_upper_cur) <= 0.005 * c
+        near_lower = abs(c - bb_lower_cur) <= 0.002 * c
+        near_upper = abs(c - bb_upper_cur) <= 0.002 * c
 
         obv_cur = float(obv_line.iloc[i])
         obv_ema_cur = float(obv_ema_v.iloc[i])
 
+        slope_flat = abs(slope) < 0.003 * c
+        atr_ok = atr_cur >= 0.003 * c
+
         c1_long = (rsi_cur < 35) or rsi_recent_low
         c2_long = near_lower or bb_long_touch_recent
         c3_long = obv_cur > obv_ema_cur
-        c4_long = slope > -0.005 * c
+        c4_long = slope_flat
 
         c1_short = (rsi_cur > 65) or rsi_recent_high
         c2_short = near_upper or bb_short_touch_recent
         c3_short = obv_cur < obv_ema_cur
-        c4_short = slope < 0.005 * c
+        c4_short = slope_flat
 
         long_arr = [c1_long, c2_long, c3_long, c4_long]
         short_arr = [c1_short, c2_short, c3_short, c4_short]
@@ -728,9 +739,14 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
         short_count = sum(short_arr)
         debug["candles_evaluated"] += 1
         debug["conditions_met_sum"] += max(long_count, short_count)
+        if c1_long or c1_short: debug["eval_c1"] += 1
+        if c2_long or c2_short: debug["eval_c2"] += 1
+        if c3_long or c3_short: debug["eval_c3"] += 1
+        if slope_flat: debug["eval_c4"] += 1
+        if not atr_ok: debug["atr_too_low"] += 1
 
-        long_fires = long_count >= 3 and long_count >= short_count
-        short_fires = (not long_fires) and short_count >= 3
+        long_fires = atr_ok and long_count == 4 and long_count >= short_count
+        short_fires = atr_ok and (not long_fires) and short_count == 4
 
         if long_fires:
             risk = sl_mult * atr_cur
@@ -807,6 +823,11 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
             "fired_c2": 0,
             "fired_c3": 0,
             "fired_c4": 0,
+            "eval_c1": 0,
+            "eval_c2": 0,
+            "eval_c3": 0,
+            "eval_c4": 0,
+            "atr_too_low": 0,
         }
         for symbol in PAIRS:
             try:
@@ -877,12 +898,24 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
         lines.append(f"Avg conditions met per fired signal: {avg_fired:.2f} / 4")
         lines.append(f"Avg conditions met per evaluated candle: {avg_evaluated:.2f} / 4")
         lines.append(f"Candles evaluated for entry: {agg_debug['candles_evaluated']:,}")
+        evals = max(agg_debug['candles_evaluated'], 1)
         lines.append(
-            f"Per-condition fires across {total_t} entries: "
-            f"c1 RSI extreme {agg_debug['fired_c1']}, "
-            f"c2 BB touch/near {agg_debug['fired_c2']}, "
-            f"c3 OBV aligned {agg_debug['fired_c3']}, "
-            f"c4 slope OK {agg_debug['fired_c4']}"
+            f"Per-condition true on evaluated candles: "
+            f"c1 RSI extreme {agg_debug['eval_c1']:,} ({100*agg_debug['eval_c1']/evals:.1f}%), "
+            f"c2 BB touch/near {agg_debug['eval_c2']:,} ({100*agg_debug['eval_c2']/evals:.1f}%), "
+            f"c3 OBV aligned {agg_debug['eval_c3']:,} ({100*agg_debug['eval_c3']/evals:.1f}%), "
+            f"c4 slope flat {agg_debug['eval_c4']:,} ({100*agg_debug['eval_c4']/evals:.1f}%)"
+        )
+        lines.append(
+            f"ATR too low (skipped): {agg_debug['atr_too_low']:,} candles "
+            f"({100*agg_debug['atr_too_low']/evals:.1f}%)"
+        )
+        lines.append(
+            f"Per-condition fires within {total_t} entries: "
+            f"c1 {agg_debug['fired_c1']}, "
+            f"c2 {agg_debug['fired_c2']}, "
+            f"c3 {agg_debug['fired_c3']}, "
+            f"c4 {agg_debug['fired_c4']}"
         )
 
         lines.append("")
