@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import threading
 from datetime import datetime, timezone, timedelta
 
 MYT = timezone(timedelta(hours=8), name="MYT")
@@ -89,7 +90,7 @@ def win_rate_text() -> str:
     return f"Current win rate: {100 * wins / total:.1f}% ({wins}/{total})"
 
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str, reply_to_message_id: int | None = None) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram credentials missing; skipping send")
         return
@@ -100,6 +101,8 @@ def send_telegram(text: str) -> None:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = reply_to_message_id
     try:
         r = requests.post(url, json=payload, timeout=15)
         if r.status_code != 200:
@@ -164,16 +167,19 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
 
 
 _4h_trend_cache: dict[str, str] = {}
+_cache_lock = threading.Lock()
 
 
 def get_4h_trend(symbol: str) -> str:
-    if symbol in _4h_trend_cache:
-        return _4h_trend_cache[symbol]
+    with _cache_lock:
+        if symbol in _4h_trend_cache:
+            return _4h_trend_cache[symbol]
     df = fetch_klines(symbol, interval="4h", limit=50)
     ema100_4h = ema(df["close"], 100).iloc[-1]
     price = df["close"].iloc[-1]
     trend = "up" if price > ema100_4h else "down"
-    _4h_trend_cache[symbol] = trend
+    with _cache_lock:
+        _4h_trend_cache[symbol] = trend
     return trend
 
 
@@ -326,9 +332,136 @@ def format_close_message(symbol: str, direction: str, r: dict, reasons: list[str
     )
 
 
+def score_pair(df: pd.DataFrame, symbol: str) -> tuple[str, int]:
+    close = df["close"]
+    volume = df["volume"]
+
+    ema100 = ema(close, 100)
+    rsi14 = rsi(close, 14)
+    macd_line, signal_line, hist = macd(close)
+    obv_line = obv(close, volume)
+    obv_ema_v = ema(obv_line, 20)
+    volume_sma20 = volume.rolling(window=20).mean()
+
+    price = close.iloc[-1]
+    ema100_now = ema100.iloc[-1]
+    rsi_now, rsi_prev = rsi14.iloc[-1], rsi14.iloc[-2]
+    macd_now = macd_line.iloc[-1]
+    sig_now = signal_line.iloc[-1]
+    hist_now, hist_prev = hist.iloc[-1], hist.iloc[-2]
+    obv_now = obv_line.iloc[-1]
+    obv_ema_now = obv_ema_v.iloc[-1]
+    vol_now = volume.iloc[-1]
+    vol_sma_now = volume_sma20.iloc[-1]
+
+    trend_4h = get_4h_trend(symbol)
+
+    rsi_in_range = 35 <= rsi_now <= 65
+    rsi_long_bounce = rsi_prev < 30 and rsi_now > rsi_prev
+    rsi_short_rollover = rsi_prev > 70 and rsi_now < rsi_prev
+    volume_ok = bool(pd.notna(vol_sma_now) and vol_now >= 1.2 * vol_sma_now)
+
+    long_score = 0
+    if price > ema100_now: long_score += 20
+    if trend_4h == "up": long_score += 20
+    if macd_now > sig_now: long_score += 15
+    if hist_now > hist_prev: long_score += 10
+    if rsi_in_range or rsi_long_bounce: long_score += 15
+    if obv_now > obv_ema_now: long_score += 10
+    if volume_ok: long_score += 10
+
+    short_score = 0
+    if price < ema100_now: short_score += 20
+    if trend_4h == "down": short_score += 20
+    if macd_now < sig_now: short_score += 15
+    if hist_now < hist_prev: short_score += 10
+    if rsi_in_range or rsi_short_rollover: short_score += 15
+    if obv_now < obv_ema_now: short_score += 10
+    if volume_ok: short_score += 10
+
+    if long_score >= short_score:
+        return "LONG", long_score
+    return "SHORT", short_score
+
+
+def handle_check_command(reply_to_message_id: int | None = None) -> None:
+    log.info("Processing /check command")
+    rankings: list[tuple[str, str, int]] = []
+    for symbol in PAIRS:
+        try:
+            df = fetch_klines(symbol)
+            if len(df) < 120:
+                continue
+            direction, score = score_pair(df, symbol)
+            rankings.append((symbol, direction, score))
+        except Exception as e:
+            log.warning("/check %s failed: %s", symbol, e)
+
+    rankings.sort(key=lambda x: x[2], reverse=True)
+    ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S MYT")
+    lines = [f"<b>Confluence check — {ts}</b>", ""]
+    for symbol, direction, score in rankings:
+        filled = round(score / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        lines.append(f"{symbol} {direction} {score}% {bar}")
+    lines.append("")
+    lines.append("<i>100% = a live signal would fire right now.</i>")
+    send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
+    log.info("/check reply sent (%d pairs)", len(rankings))
+
+
+def telegram_poll_loop() -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram polling disabled (missing credentials)")
+        return
+    target_chat = str(TELEGRAM_CHAT_ID)
+    url = f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    offset = 0
+    try:
+        r = requests.get(url, params={"offset": -1, "timeout": 0}, timeout=10)
+        if r.ok:
+            results = r.json().get("result", [])
+            if results:
+                offset = results[-1]["update_id"] + 1
+    except Exception as e:
+        log.warning("Failed to drain pending updates: %s", e)
+    log.info("Telegram /check listener started")
+    while True:
+        try:
+            r = requests.get(
+                url,
+                params={"offset": offset, "timeout": 2},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                log.warning("getUpdates failed: %s %s", r.status_code, r.text)
+                time.sleep(2)
+                continue
+            for upd in r.json().get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message")
+                if not msg:
+                    continue
+                if str(msg.get("chat", {}).get("id", "")) != target_chat:
+                    continue
+                text = (msg.get("text") or "").strip()
+                parts = text.split()
+                if not parts:
+                    continue
+                cmd = parts[0].split("@")[0]
+                if cmd == "/check":
+                    handle_check_command(msg.get("message_id"))
+        except Exception as e:
+            log.warning("Telegram poll error: %s", e)
+            time.sleep(5)
+            continue
+        time.sleep(2)
+
+
 def scan_once() -> None:
     log.info("Starting scan of %d pairs", len(PAIRS))
-    _4h_trend_cache.clear()
+    with _cache_lock:
+        _4h_trend_cache.clear()
     for symbol in PAIRS:
         try:
             df = fetch_klines(symbol)
@@ -382,6 +515,7 @@ def scan_once() -> None:
 def main() -> None:
     log.info("binance-signal-bot starting (state path: %s)", STATE_PATH)
     load_state()
+    threading.Thread(target=telegram_poll_loop, daemon=True).start()
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
         f"Watching {len(PAIRS)} pairs on {TIMEFRAME}.\n"
