@@ -2139,6 +2139,518 @@ def _d2s75_sig(p, i):
 _register("e75_zscore", "Z-Score Mean Reversion", _d2s75_pre, _d2s75_sig, None, group="discover2")
 
 
+# 76. Percentile rank reversion
+def _d2s76_pre(df, period=100):
+    return {"pct": df["close"].rolling(period).rank(pct=True) * 100}
+def _d2s76_sig(p, i):
+    cur = p["pct"].iloc[i]
+    if pd.isna(cur): return None
+    if cur < 10: return "LONG"
+    if cur > 90: return "SHORT"
+    return None
+def _d2s76_exit(p, i, d):
+    cur = p["pct"].iloc[i]
+    if pd.isna(cur): return False
+    if d == "LONG" and cur >= 50: return f"Percentile {cur:.0f}"
+    if d == "SHORT" and cur <= 50: return f"Percentile {cur:.0f}"
+    return False
+_register("e76_percentile", "Percentile Rank Reversion", _d2s76_pre, _d2s76_sig, _d2s76_exit, group="discover2")
+
+
+# 77. Hurst exponent filter (variance method, simplified)
+def _hurst(x):
+    n = len(x)
+    if n < 20 or np.any(np.isnan(x)): return float("nan")
+    try:
+        lags = [2, 4, 8, 16]
+        tau = []
+        for lag in lags:
+            diffs = np.subtract(x[lag:], x[:-lag])
+            sigma = np.std(diffs)
+            if sigma <= 0: return float("nan")
+            tau.append(np.log(sigma))
+        slope = np.polyfit(np.log(lags), tau, 1)[0]
+        return float(slope)
+    except Exception:
+        return float("nan")
+def _d2s77_pre(df):
+    h = df["close"].rolling(100).apply(_hurst, raw=True)
+    return {"h": h, "rsi": rsi(df["close"], 14)}
+def _d2s77_sig(p, i):
+    h = p["h"].iloc[i]; r = p["rsi"].iloc[i]
+    if pd.isna(h) or pd.isna(r): return None
+    if h < 0.45 and r < 35: return "LONG"
+    if h < 0.45 and r > 65: return "SHORT"
+    return None
+_register("e77_hurst", "Hurst + RSI", _d2s77_pre, _d2s77_sig, None, group="discover2")
+
+
+# 78. Autocorrelation reversal
+def _d2s78_pre(df, period=20):
+    ret = df["close"].pct_change()
+    ac = ret.rolling(period).apply(
+        lambda x: float(np.corrcoef(x[:-1], x[1:])[0, 1]) if not np.any(np.isnan(x)) else float("nan"),
+        raw=True,
+    )
+    return {"ac": ac, "ret": ret}
+def _d2s78_sig(p, i):
+    ac = p["ac"].iloc[i]; r = p["ret"].iloc[i]
+    if pd.isna(ac) or pd.isna(r): return None
+    if ac < -0.3 and r < 0: return "LONG"
+    if ac < -0.3 and r > 0: return "SHORT"
+    return None
+_register("e78_autocorr", "Autocorrelation Reversal", _d2s78_pre, _d2s78_sig, None, group="discover2")
+
+
+# 79. Regime filter (ADX > 25 EMA cross, else RSI reversion)
+def _d2s79_adx(high, low, close, period=14):
+    pc = close.shift(1)
+    tr = pd.concat([high - low, (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
+    up = high - high.shift(1); dn = low.shift(1) - low
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=close.index)
+    ndm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=close.index)
+    a = 1 / period
+    atr_w = tr.ewm(alpha=a, adjust=False).mean()
+    pdi = 100 * pdm.ewm(alpha=a, adjust=False).mean() / atr_w.replace(0, np.nan)
+    ndi = 100 * ndm.ewm(alpha=a, adjust=False).mean() / atr_w.replace(0, np.nan)
+    dx = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
+    return dx.ewm(alpha=a, adjust=False).mean()
+def _d2s79_pre(df):
+    return {
+        "adx": _d2s79_adx(df["high"], df["low"], df["close"], 50),
+        "ema9": ema(df["close"], 9), "ema21": ema(df["close"], 21),
+        "rsi": rsi(df["close"], 14),
+    }
+def _d2s79_sig(p, i):
+    if i < 1: return None
+    a = p["adx"].iloc[i]
+    if pd.isna(a): return None
+    if a > 25:
+        e9p = p["ema9"].iloc[i-1]; e9c = p["ema9"].iloc[i]
+        e21p = p["ema21"].iloc[i-1]; e21c = p["ema21"].iloc[i]
+        if any(pd.isna(x) for x in (e9p, e9c, e21p, e21c)): return None
+        if e9p <= e21p and e9c > e21c: return "LONG"
+        if e9p >= e21p and e9c < e21c: return "SHORT"
+    else:
+        rp = p["rsi"].iloc[i-1]; rc = p["rsi"].iloc[i]
+        if pd.isna(rp) or pd.isna(rc): return None
+        if rp < 30 and rc >= 30: return "LONG"
+        if rp > 70 and rc <= 70: return "SHORT"
+    return None
+_register("e79_regime", "Regime Filter", _d2s79_pre, _d2s79_sig, None, group="discover2")
+
+
+# 80. Kalman filter crossover
+def _d2s80_pre(df, q=0.01, r=1.0):
+    n = len(df); cv = df["close"].values
+    x = np.zeros(n); P = np.zeros(n)
+    x[0] = cv[0]; P[0] = 1.0
+    for i in range(1, n):
+        Pp = P[i-1] + q
+        K = Pp / (Pp + r)
+        x[i] = x[i-1] + K * (cv[i] - x[i-1])
+        P[i] = (1 - K) * Pp
+    return {"k": pd.Series(x, index=df.index), "close": df["close"]}
+def _d2s80_sig(p, i):
+    if i < 1: return None
+    cp = p["close"].iloc[i-1]; cc = p["close"].iloc[i]
+    kp = p["k"].iloc[i-1]; kc = p["k"].iloc[i]
+    if any(pd.isna(x) for x in (cp, cc, kp, kc)): return None
+    if cp <= kp and cc > kc: return "LONG"
+    if cp >= kp and cc < kc: return "SHORT"
+    return None
+_register("e80_kalman", "Kalman Filter Crossover", _d2s80_pre, _d2s80_sig, None, group="discover2")
+
+
+# 81. LSMA crossover (linreg endpoint)
+def _lsma(s, period):
+    def _ep(x):
+        if np.any(np.isnan(x)): return float("nan")
+        slope, intercept = np.polyfit(np.arange(len(x)), x, 1)
+        return float(slope * (len(x) - 1) + intercept)
+    return s.rolling(period).apply(_ep, raw=True)
+def _d2s81_pre(df):
+    return {"l9": _lsma(df["close"], 9), "l21": _lsma(df["close"], 21)}
+def _d2s81_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["l9"].iloc[i-1], p["l9"].iloc[i], p["l21"].iloc[i-1], p["l21"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["l9"].iloc[i-1], p["l9"].iloc[i], p["l21"].iloc[i-1], p["l21"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e81_lsma", "LSMA Crossover", _d2s81_pre, _d2s81_sig, None, group="discover2")
+
+
+# 82. Weighted close momentum
+def _d2s82_pre(df):
+    wc = (df["high"] + df["low"] + 2 * df["close"]) / 4
+    return {"s5": wc.rolling(5).mean(), "s20": wc.rolling(20).mean()}
+def _d2s82_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["s5"].iloc[i-1], p["s5"].iloc[i], p["s20"].iloc[i-1], p["s20"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["s5"].iloc[i-1], p["s5"].iloc[i], p["s20"].iloc[i-1], p["s20"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e82_weighted_close", "Weighted Close Momentum", _d2s82_pre, _d2s82_sig, None, group="discover2")
+
+
+# 83. Volume-weighted RSI
+def _d2s83_pre(df, period=14):
+    delta = df["close"].diff() * df["volume"]
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    ag = gain.ewm(alpha=1/period, adjust=False).mean()
+    al = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = ag / al.replace(0, np.nan)
+    return {"vwrsi": (100 - 100 / (1 + rs)).fillna(50)}
+def _d2s83_sig(p, i):
+    cur = p["vwrsi"].iloc[i]
+    if pd.isna(cur): return None
+    if cur < 30: return "LONG"
+    if cur > 70: return "SHORT"
+    return None
+_register("e83_vw_rsi", "Volume-Weighted RSI", _d2s83_pre, _d2s83_sig, None, group="discover2")
+
+
+# 84. Tick volume pressure
+def _d2s84_pre(df, period=10):
+    up = (df["close"] > df["close"].shift(1)).astype(float)
+    return {"ratio": up.rolling(period).mean()}
+def _d2s84_sig(p, i):
+    cur = p["ratio"].iloc[i]
+    if pd.isna(cur): return None
+    if cur < 0.3: return "LONG"
+    if cur > 0.7: return "SHORT"
+    return None
+_register("e84_tick_pressure", "Tick Volume Pressure", _d2s84_pre, _d2s84_sig, None, group="discover2")
+
+
+# 85. Price density
+def _d2s85_pre(df, period=20):
+    a = atr(df["high"], df["low"], df["close"], 14)
+    closes = df["close"]
+    def _density(window, atr_v, cur):
+        if pd.isna(atr_v) or atr_v <= 0: return float("nan")
+        return float(np.sum(np.abs(window - cur) <= atr_v))
+    density = pd.Series(np.full(len(df), np.nan), index=df.index)
+    cv = closes.values; av = a.values
+    for i in range(period, len(df)):
+        if pd.isna(av[i]): continue
+        density.iloc[i] = float(np.sum(np.abs(cv[i-period:i] - cv[i]) <= av[i]))
+    hh = df["high"].rolling(period).max().shift(1)
+    ll = df["low"].rolling(period).min().shift(1)
+    return {"density": density, "hh": hh, "ll": ll, "close": df["close"]}
+def _d2s85_sig(p, i):
+    den = p["density"].iloc[i]; c = p["close"].iloc[i]
+    hh = p["hh"].iloc[i]; ll = p["ll"].iloc[i]
+    if any(pd.isna(x) for x in (den, c, hh, ll)): return None
+    if den < 12: return None
+    if c > hh: return "LONG"
+    if c < ll: return "SHORT"
+    return None
+_register("e85_density", "Price Density Breakout", _d2s85_pre, _d2s85_sig, None, group="discover2")
+
+
+# 86. Gap and go
+def _d2s86_pre(df):
+    return {"o": df["open"], "c": df["close"], "v": df["volume"],
+            "vsma": df["volume"].rolling(20).mean()}
+def _d2s86_sig(p, i):
+    if i < 1: return None
+    o = p["o"].iloc[i]; c = p["c"].iloc[i]
+    cp = p["c"].iloc[i-1]; v = p["v"].iloc[i]; vs = p["vsma"].iloc[i]
+    if any(pd.isna(x) for x in (o, c, cp, v, vs)): return None
+    if cp <= 0 or vs <= 0: return None
+    gap = (o - cp) / cp
+    if gap > 0.005 and c > o and v > vs: return "LONG"
+    if gap < -0.005 and c < o and v > vs: return "SHORT"
+    return None
+_register("e86_gap_go", "Gap and Go", _d2s86_pre, _d2s86_sig, None, group="discover2")
+
+
+# 87. Mean reversion after spike
+def _d2s87_pre(df):
+    a = atr(df["high"], df["low"], df["close"], 14)
+    rng = df["high"] - df["low"]
+    return {"o": df["open"], "h": df["high"], "l": df["low"], "c": df["close"],
+            "atr_avg": a, "rng": rng}
+def _d2s87_sig(p, i):
+    if i < 1: return None
+    a = p["atr_avg"].iloc[i]; rp = p["rng"].iloc[i-1]
+    if pd.isna(a) or pd.isna(rp) or a <= 0: return None
+    if rp < 3 * a: return None
+    cp = p["c"].iloc[i-1]; op = p["o"].iloc[i-1]
+    cc = p["c"].iloc[i]; oc = p["o"].iloc[i]
+    if any(pd.isna(x) for x in (cp, op, cc, oc)): return None
+    spike_up = cp > op  # bullish spike
+    spike_dn = cp < op  # bearish spike
+    if spike_up:
+        midspike = (op + cp) / 2
+        retrace = (cp - cc) / (cp - op + 1e-9) if cp > op else 0
+        if retrace > 0.5: return "SHORT"
+    if spike_dn:
+        midspike = (op + cp) / 2
+        retrace = (cc - cp) / (op - cp + 1e-9) if op > cp else 0
+        if retrace > 0.5: return "LONG"
+    return None
+_register("e87_spike_rev", "Spike Mean Reversion", _d2s87_pre, _d2s87_sig, None, group="discover2")
+
+
+# 88. Consecutive closes
+def _d2s88_pre(df):
+    return {"o": df["open"], "c": df["close"], "rsi": rsi(df["close"], 14)}
+def _d2s88_sig(p, i):
+    if i < 4: return None
+    c = p["c"]; o = p["o"]
+    bears = all(c.iloc[i-k] < c.iloc[i-k-1] for k in range(1, 5))
+    bulls = all(c.iloc[i-k] > c.iloc[i-k-1] for k in range(1, 5))
+    r = p["rsi"].iloc[i]
+    if pd.isna(r): return None
+    cur_bull = c.iloc[i] > o.iloc[i]
+    cur_bear = c.iloc[i] < o.iloc[i]
+    if bears and cur_bull and r < 45: return "LONG"
+    if bulls and cur_bear and r > 55: return "SHORT"
+    return None
+_register("e88_consec_closes", "Consecutive Closes Reversal", _d2s88_pre, _d2s88_sig, None, group="discover2")
+
+
+# 89. HL channel position
+def _d2s89_pre(df, period=20):
+    hh = df["high"].rolling(period).max()
+    ll = df["low"].rolling(period).min()
+    rng = (hh - ll).replace(0, np.nan)
+    return {"pos": 100 * (df["close"] - ll) / rng}
+def _d2s89_sig(p, i):
+    cur = p["pos"].iloc[i]
+    if pd.isna(cur): return None
+    if cur < 10: return "LONG"
+    if cur > 90: return "SHORT"
+    return None
+def _d2s89_exit(p, i, d):
+    cur = p["pos"].iloc[i]
+    if pd.isna(cur): return False
+    if d == "LONG" and cur >= 50: return f"HL pos {cur:.0f}"
+    if d == "SHORT" and cur <= 50: return f"HL pos {cur:.0f}"
+    return False
+_register("e89_hl_pos", "HL Channel Position", _d2s89_pre, _d2s89_sig, _d2s89_exit, group="discover2")
+
+
+# 90. Relative strength pairs (per-pair simplification: ROC vs its rolling mean ROC)
+def _d2s90_pre(df):
+    roc = _roc(df["close"], 10)
+    return {"roc": roc, "roc_avg": roc.rolling(50).mean(), "rsi": rsi(df["close"], 14)}
+def _d2s90_sig(p, i):
+    rc = p["roc"].iloc[i]; ra = p["roc_avg"].iloc[i]; r = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (rc, ra, r)): return None
+    if rc < ra - 5 and r < 40: return "LONG"
+    if rc > ra + 5 and r > 60: return "SHORT"
+    return None
+_register("e90_rel_strength", "Relative Strength Reversion", _d2s90_pre, _d2s90_sig, None, group="discover2")
+
+
+# 91. Volume profile reversion (POC = price level with most volume in 50 bars)
+def _d2s91_pre(df, period=50):
+    closes = df["close"].values; vols = df["volume"].values
+    vah = np.full(len(df), np.nan)
+    val = np.full(len(df), np.nan)
+    for i in range(period, len(df)):
+        c_window = closes[i-period:i]; v_window = vols[i-period:i]
+        if np.any(np.isnan(c_window)) or np.any(np.isnan(v_window)): continue
+        try:
+            bins = np.linspace(c_window.min(), c_window.max(), 10)
+            idx = np.digitize(c_window, bins) - 1
+            idx = np.clip(idx, 0, 9)
+            bin_vol = np.zeros(10)
+            for k in range(len(c_window)):
+                bin_vol[idx[k]] += v_window[k]
+            poc_bin = int(np.argmax(bin_vol))
+            poc_price = (bins[poc_bin] + bins[min(poc_bin + 1, 9)]) / 2
+            vah[i] = poc_price * 1.005
+            val[i] = poc_price * 0.995
+        except Exception:
+            continue
+    return {"vah": pd.Series(vah, index=df.index), "val": pd.Series(val, index=df.index),
+            "close": df["close"]}
+def _d2s91_sig(p, i):
+    c = p["close"].iloc[i]; vah = p["vah"].iloc[i]; val = p["val"].iloc[i]
+    if any(pd.isna(x) for x in (c, vah, val)): return None
+    if c < val * 0.98: return "LONG"
+    if c > vah * 1.02: return "SHORT"
+    return None
+_register("e91_vol_profile", "Volume Profile Reversion", _d2s91_pre, _d2s91_sig, None, group="discover2")
+
+
+# 92. Candle body momentum
+def _d2s92_pre(df):
+    body = (df["close"] - df["open"]).abs()
+    rng = (df["high"] - df["low"]).replace(0, np.nan)
+    return {"body_ratio": (body / rng).rolling(5).mean(),
+            "o": df["open"], "c": df["close"]}
+def _d2s92_sig(p, i):
+    if i < 2: return None
+    br = p["body_ratio"].iloc[i]
+    o = p["o"]; c = p["c"]
+    if pd.isna(br) or br < 0.6: return None
+    if all(c.iloc[i-k] > o.iloc[i-k] for k in range(0, 3)): return "LONG"
+    if all(c.iloc[i-k] < o.iloc[i-k] for k in range(0, 3)): return "SHORT"
+    return None
+_register("e92_body_momentum", "Body Momentum", _d2s92_pre, _d2s92_sig, None, group="discover2")
+
+
+# 93. Wick rejection
+def _d2s93_pre(df):
+    return {"o": df["open"], "h": df["high"], "l": df["low"], "c": df["close"],
+            "vsma": df["volume"].rolling(20).mean(), "v": df["volume"]}
+def _d2s93_sig(p, i):
+    o = p["o"].iloc[i]; h = p["h"].iloc[i]; l = p["l"].iloc[i]; c = p["c"].iloc[i]
+    v = p["v"].iloc[i]; vs = p["vsma"].iloc[i]
+    if any(pd.isna(x) for x in (o, h, l, c, v, vs)): return None
+    if vs <= 0 or v <= vs: return None
+    upper = h - max(o, c); lower = min(o, c) - l
+    if lower > 3 * upper and c > o: return "LONG"
+    if upper > 3 * lower and c < o: return "SHORT"
+    return None
+_register("e93_wick_rejection", "Wick Rejection", _d2s93_pre, _d2s93_sig, None, group="discover2")
+
+
+# 94. Support/Resistance bounce
+def _d2s94_pre(df, period=50):
+    closes = df["close"]
+    sup = pd.Series(np.full(len(df), np.nan), index=df.index)
+    res = pd.Series(np.full(len(df), np.nan), index=df.index)
+    lv = df["low"].values; hv = df["high"].values
+    for i in range(period, len(df)):
+        l_w = lv[i-period:i]; h_w = hv[i-period:i]
+        if np.any(np.isnan(l_w)): continue
+        sorted_lows = np.sort(l_w)[:3]
+        sorted_highs = np.sort(h_w)[-3:]
+        sup.iloc[i] = float(np.mean(sorted_lows))
+        res.iloc[i] = float(np.mean(sorted_highs))
+    return {"sup": sup, "res": res, "close": closes, "rsi": rsi(closes, 14)}
+def _d2s94_sig(p, i):
+    c = p["close"].iloc[i]; s = p["sup"].iloc[i]; rr = p["res"].iloc[i]
+    r = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (c, s, rr, r)): return None
+    if abs(c - s) / s < 0.003 and r < 50: return "LONG"
+    if abs(c - rr) / rr < 0.003 and r > 50: return "SHORT"
+    return None
+_register("e94_sr_bounce", "Support/Resistance Bounce", _d2s94_pre, _d2s94_sig, None, group="discover2")
+
+
+# 95. Volatility contraction expansion
+def _d2s95_pre(df):
+    a5 = atr(df["high"], df["low"], df["close"], 5)
+    a20 = atr(df["high"], df["low"], df["close"], 20)
+    return {"ratio": a5 / a20.replace(0, np.nan), "o": df["open"], "c": df["close"]}
+def _d2s95_sig(p, i):
+    if i < 1: return None
+    ratio_prev = p["ratio"].iloc[i-1]
+    if pd.isna(ratio_prev) or ratio_prev >= 0.7: return None
+    o = p["o"].iloc[i]; c = p["c"].iloc[i]
+    if pd.isna(o) or pd.isna(c): return None
+    if c > o: return "LONG"
+    if c < o: return "SHORT"
+    return None
+_register("e95_vol_ce", "Volatility Contraction/Expansion", _d2s95_pre, _d2s95_sig, None, group="discover2")
+
+
+# 96. Return distribution skew
+def _d2s96_pre(df, period=20):
+    ret = df["close"].pct_change()
+    skew = ret.rolling(period).skew()
+    return {"skew": skew}
+def _d2s96_sig(p, i):
+    cur = p["skew"].iloc[i]
+    if pd.isna(cur): return None
+    if cur < -1: return "LONG"
+    if cur > 1: return "SHORT"
+    return None
+_register("e96_skew", "Return Skew Reversion", _d2s96_pre, _d2s96_sig, None, group="discover2")
+
+
+# 97. Entropy filter (proxy: rolling normalized std of returns)
+def _d2s97_pre(df, period=20):
+    ret = df["close"].pct_change()
+    entropy_proxy = ret.rolling(period).std() * np.sqrt(period)
+    return {"entropy": entropy_proxy, "rsi": rsi(df["close"], 14)}
+def _d2s97_sig(p, i):
+    if i < 1: return None
+    pp = p["entropy"].iloc[i-1]; pc = p["entropy"].iloc[i]
+    r = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (pp, pc, r)): return None
+    rising = pc > pp
+    if rising and r < 45: return "LONG"
+    if rising and r > 55: return "SHORT"
+    return None
+_register("e97_entropy", "Entropy Filter", _d2s97_pre, _d2s97_sig, None, group="discover2")
+
+
+# 98. Cross-asset momentum (use same pair's ROC3 as proxy; cannot read other pairs in per-pair backtest)
+def _d2s98_pre(df):
+    return {"roc3": _roc(df["close"], 3), "rsi": rsi(df["close"], 14)}
+def _d2s98_sig(p, i):
+    r3 = p["roc3"].iloc[i]; r = p["rsi"].iloc[i]
+    if pd.isna(r3) or pd.isna(r): return None
+    if r3 > 0 and r < 35: return "LONG"
+    if r3 < 0 and r > 65: return "SHORT"
+    return None
+_register("e98_cross_momentum", "Cross-Asset Momentum (proxy)", _d2s98_pre, _d2s98_sig, None, group="discover2")
+
+
+# 99. Combination mean reversion
+def _d2s99_pre(df):
+    u, m, l = compute_bollinger_bands(df["close"], 20, 2.0)
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    rmf = typical * df["volume"]
+    delta = typical.diff()
+    pos_mf = pd.Series(np.where(delta > 0, rmf, 0), index=df.index)
+    neg_mf = pd.Series(np.where(delta < 0, rmf, 0), index=df.index)
+    mfr = pos_mf.rolling(14).sum() / neg_mf.rolling(14).sum().replace(0, np.nan)
+    mfi = 100 - (100 / (1 + mfr))
+    return {
+        "rsi": rsi(df["close"], 14), "bb_lower": l, "bb_upper": u,
+        "mfi": mfi, "cci": _cci(df, 20),
+        "wr": compute_williams_r(df["high"], df["low"], df["close"], 14),
+        "close": df["close"],
+    }
+def _d2s99_sig(p, i):
+    r = p["rsi"].iloc[i]; bl = p["bb_lower"].iloc[i]; bu = p["bb_upper"].iloc[i]
+    mfi = p["mfi"].iloc[i]; cci = p["cci"].iloc[i]; wr = p["wr"].iloc[i]
+    c = p["close"].iloc[i]
+    if any(pd.isna(x) for x in (r, bl, bu, mfi, cci, wr, c)): return None
+    long_conds = sum([r < 35, c < bl, mfi < 25, cci < -100, wr < -80])
+    short_conds = sum([r > 65, c > bu, mfi > 75, cci > 100, wr > -20])
+    if long_conds >= 3: return "LONG"
+    if short_conds >= 3: return "SHORT"
+    return None
+_register("e99_combo_meanrev", "Combination Mean Reversion", _d2s99_pre, _d2s99_sig, None, group="discover2")
+
+
+# 100. Adaptive regime (Hurst switch between Combo and Supertrend)
+def _d2s100_pre(df):
+    return {
+        "hurst": df["close"].rolling(100).apply(_hurst, raw=True),
+        "combo": _d2s99_pre(df),
+        "st": dict(zip(("st_line", "st_dir"),
+                       compute_supertrend(df["high"], df["low"], df["close"], 10, 3.0))),
+        "close": df["close"],
+    }
+def _d2s100_sig(p, i):
+    h = p["hurst"].iloc[i]
+    if pd.isna(h): return None
+    if h < 0.5:
+        return _d2s99_sig(p["combo"], i)
+    else:
+        if i < 1: return None
+        dp = p["st"]["st_dir"].iloc[i-1]; dc = p["st"]["st_dir"].iloc[i]
+        if pd.isna(dp) or pd.isna(dc): return None
+        if dp == -1 and dc == 1: return "LONG"
+        if dp == 1 and dc == -1: return "SHORT"
+        return None
+_register("e100_adaptive_regime", "Adaptive Regime (Hurst switch)", _d2s100_pre, _d2s100_sig, None, group="discover2")
+
+
 def handle_discover2_command(reply_to_message_id: int | None = None) -> None:
     global discover_running
     with discover_lock:
