@@ -252,6 +252,745 @@ def compute_bollinger_bands(close: pd.Series, period: int = 20, std: float = 2.0
     return upper, middle, lower
 
 
+# ===== Strategy discovery framework =====
+
+def compute_williams_r(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    hh = high.rolling(window=period).max()
+    ll = low.rolling(window=period).min()
+    rng = (hh - ll).replace(0, np.nan)
+    return -100 * (hh - close) / rng
+
+
+def compute_stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
+                       k_period: int = 14, k_smooth: int = 3, d_smooth: int = 3):
+    ll = low.rolling(window=k_period).min()
+    hh = high.rolling(window=k_period).max()
+    raw_k = 100 * (close - ll) / (hh - ll).replace(0, np.nan)
+    k = raw_k.rolling(window=k_smooth).mean()
+    d = k.rolling(window=d_smooth).mean()
+    return k, d
+
+
+def compute_supertrend(high: pd.Series, low: pd.Series, close: pd.Series,
+                       period: int = 10, mult: float = 3.0):
+    hl2 = (high + low) / 2
+    atr_v = atr(high, low, close, period)
+    bu = (hl2 + mult * atr_v).values
+    bl = (hl2 - mult * atr_v).values
+    cl = close.values
+    n = len(close)
+    fu = np.full(n, np.nan)
+    fl = np.full(n, np.nan)
+    direction = np.ones(n, dtype=int)
+    for i in range(n):
+        if i == 0 or np.isnan(bu[i]):
+            fu[i] = bu[i]
+            fl[i] = bl[i]
+            direction[i] = 1
+            continue
+        if np.isnan(fu[i - 1]):
+            fu[i] = bu[i]
+        elif bu[i] < fu[i - 1] or cl[i - 1] > fu[i - 1]:
+            fu[i] = bu[i]
+        else:
+            fu[i] = fu[i - 1]
+        if np.isnan(fl[i - 1]):
+            fl[i] = bl[i]
+        elif bl[i] > fl[i - 1] or cl[i - 1] < fl[i - 1]:
+            fl[i] = bl[i]
+        else:
+            fl[i] = fl[i - 1]
+        prev = direction[i - 1]
+        if prev == -1 and cl[i] > fu[i]:
+            direction[i] = 1
+        elif prev == 1 and cl[i] < fl[i]:
+            direction[i] = -1
+        else:
+            direction[i] = prev
+    line = np.where(direction == 1, fl, fu)
+    return pd.Series(line, index=close.index), pd.Series(direction, index=close.index)
+
+
+def compute_heikin_ashi(open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series):
+    n = len(close)
+    ha_close = (open_ + high + low + close) / 4
+    ha_close_v = ha_close.values
+    o = open_.values
+    h = high.values
+    l = low.values
+    ha_open = np.full(n, np.nan)
+    ha_high = np.full(n, np.nan)
+    ha_low = np.full(n, np.nan)
+    ha_open[0] = (o[0] + close.iloc[0]) / 2
+    ha_high[0] = h[0]
+    ha_low[0] = l[0]
+    for i in range(1, n):
+        ha_open[i] = (ha_open[i - 1] + ha_close_v[i - 1]) / 2
+        ha_high[i] = max(h[i], ha_open[i], ha_close_v[i])
+        ha_low[i] = min(l[i], ha_open[i], ha_close_v[i])
+    return (
+        pd.Series(ha_open, index=close.index),
+        pd.Series(ha_high, index=close.index),
+        pd.Series(ha_low, index=close.index),
+        ha_close,
+    )
+
+
+def compute_rolling_vwap(df: pd.DataFrame, reset_period: int = 24) -> pd.Series:
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    tp_vol = typical * df["volume"]
+    group = pd.Series(np.arange(len(df)) // reset_period, index=df.index)
+    cumul_tp_vol = tp_vol.groupby(group).cumsum()
+    cumul_vol = df["volume"].groupby(group).cumsum()
+    return cumul_tp_vol / cumul_vol.replace(0, np.nan)
+
+
+class _Strategy:
+    """Wraps precompute + signal + optional exit functions."""
+    def __init__(self, sid, name, precompute_fn, signal_fn, exit_fn=None,
+                 sl_mult=1.5, tp_mult=2.5, group="discover"):
+        self.id = sid
+        self.name = name
+        self._precompute = precompute_fn
+        self._signal = signal_fn
+        self._exit = exit_fn
+        self.sl_mult = sl_mult
+        self.tp_mult = tp_mult
+        self.group = group
+
+    def precompute(self, df):
+        p = self._precompute(df)
+        if "atr" not in p:
+            p["atr"] = atr(df["high"], df["low"], df["close"], 14)
+        return p
+
+    def entry_signal_at(self, p, i):
+        try:
+            return self._signal(p, i)
+        except Exception:
+            return None
+
+    def exit_reasons_at(self, p, i, direction):
+        if self._exit is None:
+            return []
+        try:
+            r = self._exit(p, i, direction)
+        except Exception:
+            return []
+        if r is False or r is None:
+            return []
+        if r is True:
+            return [f"{self.name} exit"]
+        if isinstance(r, str):
+            return [r]
+        if isinstance(r, list):
+            return r
+        return []
+
+    def evaluate(self, df, symbol):
+        p = self.precompute(df)
+        n = len(df["close"])
+        idx = n - 1
+        direction = self.entry_signal_at(p, idx) if n >= 50 else None
+        long_exits = self.exit_reasons_at(p, idx, "LONG") if n >= 50 else []
+        short_exits = self.exit_reasons_at(p, idx, "SHORT") if n >= 50 else []
+        price = float(df["close"].iloc[-1])
+        atr_v = 0.0
+        if "atr" in p and len(p["atr"]) > 0:
+            v = p["atr"].iloc[-1]
+            atr_v = float(v) if pd.notna(v) else 0.0
+        result = {
+            "direction": direction,
+            "price": price,
+            "atr": atr_v,
+            "rsi": 0.0,
+            "bb_upper": 0.0,
+            "bb_middle": 0.0,
+            "bb_lower": 0.0,
+            "candle_time": df["close_time"].iloc[-1],
+            "__strategy_long_exits": long_exits,
+            "__strategy_short_exits": short_exits,
+        }
+        for key in ("rsi", "bb_upper", "bb_middle", "bb_lower"):
+            if key in p and len(p[key]) > 0:
+                v = p[key].iloc[-1]
+                if pd.notna(v):
+                    result[key] = float(v)
+        return result
+
+    def score_at(self, p, i):
+        # Default: 100 if signal would fire, else 0
+        try:
+            sig = self._signal(p, i)
+        except Exception:
+            return 0, 0
+        if sig == "LONG":
+            return 100, 0
+        if sig == "SHORT":
+            return 0, 100
+        return 0, 0
+
+
+STRATEGIES: list[_Strategy] = []
+STRATEGIES_BY_ID: dict[str, _Strategy] = {}
+
+
+def _register(sid, name, precompute_fn, signal_fn, exit_fn=None,
+              sl_mult=1.5, tp_mult=2.5, group="discover"):
+    s = _Strategy(sid, name, precompute_fn, signal_fn, exit_fn,
+                  sl_mult, tp_mult, group)
+    STRATEGIES.append(s)
+    STRATEGIES_BY_ID[sid] = s
+    return s
+
+
+# ===== /discover strategies (10) =====
+
+def _s1_pre(df):
+    return {"rsi": rsi(df["close"], 14)}
+def _s1_sig(p, i):
+    if i < 1: return None
+    pr = p["rsi"].iloc[i-1]; cu = p["rsi"].iloc[i]
+    if pd.isna(pr) or pd.isna(cu): return None
+    if pr < 30 and cu >= 30: return "LONG"
+    if pr > 70 and cu <= 70: return "SHORT"
+    return None
+def _s1_exit(p, i, d):
+    cu = p["rsi"].iloc[i]
+    if pd.isna(cu): return False
+    if d == "LONG" and cu >= 50: return f"RSI hit 50 ({cu:.1f})"
+    if d == "SHORT" and cu <= 50: return f"RSI hit 50 ({cu:.1f})"
+    return False
+_register("d1_rsi_meanrev", "Pure RSI Mean Reversion", _s1_pre, _s1_sig, _s1_exit)
+
+
+def _s2_pre(df):
+    u, m, l = compute_bollinger_bands(df["close"], 20, 2.0)
+    width = (u - l) / m.replace(0, np.nan)
+    return {
+        "bb_upper": u, "bb_middle": m, "bb_lower": l,
+        "width": width, "width_avg": width.rolling(20).mean(),
+        "vol": df["volume"], "vol_sma": df["volume"].rolling(20).mean(),
+    }
+def _s2_sig(p, i):
+    if i < 5: return None
+    w = p["width"]; wa = p["width_avg"]
+    squeeze = all(
+        pd.notna(w.iloc[i-k]) and pd.notna(wa.iloc[i-k]) and w.iloc[i-k] < wa.iloc[i-k]
+        for k in range(1, 6)
+    )
+    if not squeeze: return None
+    c = p["bb_upper"].iloc[i]; b = p["bb_lower"].iloc[i]
+    cl = float(p["bb_middle"].iloc[i])
+    vol = p["vol"].iloc[i]; vs = p["vol_sma"].iloc[i]
+    if pd.isna(vol) or pd.isna(vs) or vs <= 0: return None
+    vol_ok = vol >= 1.5 * vs
+    if not vol_ok: return None
+    # Need actual close
+    return None  # signal_fn doesn't have access to close directly; handled via wrapper
+_register("d2_bb_squeeze", "BB Squeeze Breakout", _s2_pre, _s2_sig, None,
+          sl_mult=1.5, tp_mult=2.5)
+
+
+def _s3_pre(df):
+    return {
+        "ema9": ema(df["close"], 9),
+        "ema21": ema(df["close"], 21),
+        "vol": df["volume"],
+        "vol_sma": df["volume"].rolling(20).mean(),
+    }
+def _s3_sig(p, i):
+    if i < 1: return None
+    e9p = p["ema9"].iloc[i-1]; e9c = p["ema9"].iloc[i]
+    e21p = p["ema21"].iloc[i-1]; e21c = p["ema21"].iloc[i]
+    if any(pd.isna(x) for x in (e9p, e9c, e21p, e21c)): return None
+    vol = p["vol"].iloc[i]; vs = p["vol_sma"].iloc[i]
+    vol_ok = pd.notna(vs) and pd.notna(vol) and vol > vs
+    if not vol_ok: return None
+    if e9p <= e21p and e9c > e21c: return "LONG"
+    if e9p >= e21p and e9c < e21c: return "SHORT"
+    return None
+def _s3_exit(p, i, d):
+    if i < 1: return False
+    e9p = p["ema9"].iloc[i-1]; e9c = p["ema9"].iloc[i]
+    e21p = p["ema21"].iloc[i-1]; e21c = p["ema21"].iloc[i]
+    if any(pd.isna(x) for x in (e9p, e9c, e21p, e21c)): return False
+    if d == "LONG" and e9p >= e21p and e9c < e21c: return "EMA9 crossed below EMA21"
+    if d == "SHORT" and e9p <= e21p and e9c > e21c: return "EMA9 crossed above EMA21"
+    return False
+_register("d3_ema_cross_vol", "EMA9/21 Crossover with Volume", _s3_pre, _s3_sig, _s3_exit)
+
+
+def _s4_pre(df):
+    return {
+        "vwap": compute_rolling_vwap(df, 24),
+        "rsi": rsi(df["close"], 14),
+        "close": df["close"],
+    }
+def _s4_sig(p, i):
+    c = p["close"].iloc[i]
+    v = p["vwap"].iloc[i]
+    r = p["rsi"].iloc[i]
+    if pd.isna(c) or pd.isna(v) or pd.isna(r) or v <= 0: return None
+    diff_pct = (c - v) / v
+    if diff_pct < -0.015 and r < 40: return "LONG"
+    if diff_pct > 0.015 and r > 60: return "SHORT"
+    return None
+def _s4_exit(p, i, d):
+    if i < 1: return False
+    cp = p["close"].iloc[i-1]; cc = p["close"].iloc[i]
+    vp = p["vwap"].iloc[i-1]; vc = p["vwap"].iloc[i]
+    if any(pd.isna(x) for x in (cp, cc, vp, vc)): return False
+    if d == "LONG" and cp < vp and cc >= vc: return "Price returned to VWAP"
+    if d == "SHORT" and cp > vp and cc <= vc: return "Price returned to VWAP"
+    return False
+_register("d4_vwap_reversion", "VWAP Reversion", _s4_pre, _s4_sig, _s4_exit)
+
+
+def _s5_pre(df):
+    k, d = compute_stochastic(df["high"], df["low"], df["close"], 14, 3, 3)
+    return {"k": k, "d": d}
+def _s5_sig(p, i):
+    if i < 1: return None
+    kp = p["k"].iloc[i-1]; kc = p["k"].iloc[i]
+    dp = p["d"].iloc[i-1]; dc = p["d"].iloc[i]
+    if any(pd.isna(x) for x in (kp, kc, dp, dc)): return None
+    if kp <= dp and kc > dc and kc < 20: return "LONG"
+    if kp >= dp and kc < dc and kc > 80: return "SHORT"
+    return None
+def _s5_exit(p, i, d):
+    kc = p["k"].iloc[i]
+    if pd.isna(kc): return False
+    if d == "LONG" and (kc >= 50 or kc >= 80): return f"Stoch K {kc:.1f}"
+    if d == "SHORT" and (kc <= 50 or kc <= 20): return f"Stoch K {kc:.1f}"
+    return False
+_register("d5_stochastic", "Stochastic Crossover", _s5_pre, _s5_sig, _s5_exit)
+
+
+def _s6_pre(df):
+    u, m, l = compute_bollinger_bands(df["close"], 20, 2.0)
+    return {
+        "rsi": rsi(df["close"], 14),
+        "bb_middle": m, "bb_upper": u, "bb_lower": l,
+        "low": df["low"], "high": df["high"], "close": df["close"],
+    }
+def _s6_sig(p, i):
+    if i < 5: return None
+    r = p["rsi"]; lo = p["low"]; hi = p["high"]
+    rc = r.iloc[i]; rb = r.iloc[i-5]
+    lc = lo.iloc[i]; lb = lo.iloc[i-5]
+    hc = hi.iloc[i]; hb = hi.iloc[i-5]
+    if any(pd.isna(x) for x in (rc, rb, lc, lb, hc, hb)): return None
+    if rc < 45 and lc < lb and rc > rb: return "LONG"
+    if rc > 55 and hc > hb and rc < rb: return "SHORT"
+    return None
+def _s6_exit(p, i, d):
+    c = p["close"].iloc[i]; m = p["bb_middle"].iloc[i]
+    if pd.isna(c) or pd.isna(m): return False
+    if d == "LONG" and c >= m: return "Reached BB middle"
+    if d == "SHORT" and c <= m: return "Reached BB middle"
+    return False
+_register("d6_rsi_divergence", "RSI Divergence", _s6_pre, _s6_sig, _s6_exit)
+
+
+def _s7_pre(df):
+    line, direction = compute_supertrend(df["high"], df["low"], df["close"], 10, 3.0)
+    return {"st_line": line, "st_dir": direction, "close": df["close"]}
+def _s7_sig(p, i):
+    if i < 1: return None
+    dp = p["st_dir"].iloc[i-1]; dc = p["st_dir"].iloc[i]
+    if pd.isna(dp) or pd.isna(dc): return None
+    if dp == -1 and dc == 1: return "LONG"
+    if dp == 1 and dc == -1: return "SHORT"
+    return None
+def _s7_exit(p, i, d):
+    if i < 1: return False
+    dp = p["st_dir"].iloc[i-1]; dc = p["st_dir"].iloc[i]
+    if pd.isna(dp) or pd.isna(dc): return False
+    if d == "LONG" and dp == 1 and dc == -1: return "Supertrend flipped down"
+    if d == "SHORT" and dp == -1 and dc == 1: return "Supertrend flipped up"
+    return False
+_register("d7_supertrend", "Supertrend", _s7_pre, _s7_sig, _s7_exit)
+
+
+def _s8_pre(df):
+    ho, hh, hl, hc = compute_heikin_ashi(df["open"], df["high"], df["low"], df["close"])
+    return {"ha_open": ho, "ha_close": hc}
+def _s8_sig(p, i):
+    if i < 2: return None
+    ho = p["ha_open"]; hc = p["ha_close"]
+    g = lambda k: pd.notna(ho.iloc[k]) and pd.notna(hc.iloc[k]) and hc.iloc[k] > ho.iloc[k]
+    r = lambda k: pd.notna(ho.iloc[k]) and pd.notna(hc.iloc[k]) and hc.iloc[k] < ho.iloc[k]
+    if g(i) and g(i-1) and g(i-2): return "LONG"
+    if r(i) and r(i-1) and r(i-2): return "SHORT"
+    return None
+def _s8_exit(p, i, d):
+    ho = p["ha_open"].iloc[i]; hc = p["ha_close"].iloc[i]
+    if pd.isna(ho) or pd.isna(hc): return False
+    if d == "LONG" and hc < ho: return "First red HA candle"
+    if d == "SHORT" and hc > ho: return "First green HA candle"
+    return False
+_register("d8_heikin_ashi", "Heikin Ashi Trend", _s8_pre, _s8_sig, _s8_exit)
+
+
+def _s9_pre(df):
+    return {"wr": compute_williams_r(df["high"], df["low"], df["close"], 14)}
+def _s9_sig(p, i):
+    if i < 1: return None
+    wp = p["wr"].iloc[i-1]; wc = p["wr"].iloc[i]
+    if pd.isna(wp) or pd.isna(wc): return None
+    if wp <= -80 and wc > -80: return "LONG"
+    if wp >= -20 and wc < -20: return "SHORT"
+    return None
+def _s9_exit(p, i, d):
+    wc = p["wr"].iloc[i]
+    if pd.isna(wc): return False
+    if d == "LONG" and wc >= -50: return f"W%R hit -50 ({wc:.1f})"
+    if d == "SHORT" and wc <= -50: return f"W%R hit -50 ({wc:.1f})"
+    return False
+_register("d9_williams_r", "Williams %R", _s9_pre, _s9_sig, _s9_exit)
+
+
+def _s10_pre(df):
+    return {
+        "rsi3": rsi(df["close"], 3),
+        "rsi": rsi(df["close"], 14),
+    }
+def _s10_sig(p, i):
+    if i < 1: return None
+    r3p = p["rsi3"].iloc[i-1]; r3c = p["rsi3"].iloc[i]
+    r14 = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (r3p, r3c, r14)): return None
+    if r3p < 20 and r3c >= 20 and r14 < 50: return "LONG"
+    if r3p > 80 and r3c <= 80 and r14 > 50: return "SHORT"
+    return None
+def _s10_exit(p, i, d):
+    r3 = p["rsi3"].iloc[i]
+    if pd.isna(r3): return False
+    if d == "LONG" and r3 >= 80: return f"RSI(3) hit 80 ({r3:.1f})"
+    if d == "SHORT" and r3 <= 20: return f"RSI(3) hit 20 ({r3:.1f})"
+    return False
+_register("d10_double_rsi", "Double RSI", _s10_pre, _s10_sig, _s10_exit)
+
+
+# Strategy 2 needs `close` access - rewrite signal closure
+def _s2_sig_v2(p, i):
+    if i < 5: return None
+    w = p["width"]; wa = p["width_avg"]
+    if any(pd.isna(w.iloc[i-k]) or pd.isna(wa.iloc[i-k]) or w.iloc[i-k] >= wa.iloc[i-k]
+           for k in range(1, 6)):
+        return None
+    cl = float(p["bb_middle"].iloc[i])  # not actually close but used as proxy for direction
+    upper = p["bb_upper"].iloc[i]; lower = p["bb_lower"].iloc[i]
+    if pd.isna(upper) or pd.isna(lower): return None
+    vol = p["vol"].iloc[i]; vs = p["vol_sma"].iloc[i]
+    if pd.isna(vol) or pd.isna(vs) or vs <= 0 or vol < 1.5 * vs: return None
+    # Compare close to upper/lower band — close stored as middle's underlying series? we need close.
+    # Since precompute doesn't include close, we add it.
+    return None  # will be replaced below
+
+
+def _s2_pre_v2(df):
+    u, m, l = compute_bollinger_bands(df["close"], 20, 2.0)
+    width = (u - l) / m.replace(0, np.nan)
+    return {
+        "bb_upper": u, "bb_middle": m, "bb_lower": l,
+        "width": width, "width_avg": width.rolling(20).mean(),
+        "vol": df["volume"], "vol_sma": df["volume"].rolling(20).mean(),
+        "close": df["close"],
+    }
+def _s2_sig_final(p, i):
+    if i < 5: return None
+    w = p["width"]; wa = p["width_avg"]
+    for k in range(1, 6):
+        wv = w.iloc[i-k]; wav = wa.iloc[i-k]
+        if pd.isna(wv) or pd.isna(wav) or wv >= wav:
+            return None
+    upper = p["bb_upper"].iloc[i]; lower = p["bb_lower"].iloc[i]
+    cl = p["close"].iloc[i]
+    vol = p["vol"].iloc[i]; vs = p["vol_sma"].iloc[i]
+    if any(pd.isna(x) for x in (upper, lower, cl, vol, vs)) or vs <= 0:
+        return None
+    if vol < 1.5 * vs: return None
+    if cl > upper: return "LONG"
+    if cl < lower: return "SHORT"
+    return None
+
+# Re-register strategy 2 with the corrected versions
+STRATEGIES_BY_ID["d2_bb_squeeze"]._precompute = _s2_pre_v2
+STRATEGIES_BY_ID["d2_bb_squeeze"]._signal = _s2_sig_final
+
+
+# ===== Strategy persistence and discovery loop =====
+
+STRATEGY_PATH = os.environ.get(
+    "STRATEGY_PATH",
+    "/data/strategy.json" if os.path.isdir("/data") else "strategy.json",
+)
+active_strategy_id: str | None = None
+discover_running = False
+discover_lock = threading.Lock()
+
+
+def load_strategy() -> None:
+    global active_strategy_id
+    if not os.path.exists(STRATEGY_PATH):
+        log.info("No saved strategy at %s; using default", STRATEGY_PATH)
+        return
+    try:
+        with open(STRATEGY_PATH) as f:
+            data = json.load(f)
+        sid = data.get("id")
+        if sid in STRATEGIES_BY_ID:
+            active_strategy_id = sid
+            log.info("Active strategy: %s (%s)", sid, STRATEGIES_BY_ID[sid].name)
+        else:
+            log.warning("Saved strategy %s not in registry; ignoring", sid)
+    except Exception as e:
+        log.warning("Failed to load strategy: %s", e)
+
+
+def save_strategy(sid: str, meta: dict) -> None:
+    try:
+        parent = os.path.dirname(STRATEGY_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = STRATEGY_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"id": sid, "meta": meta}, f, default=str)
+        os.replace(tmp, STRATEGY_PATH)
+    except Exception as e:
+        log.warning("Failed to save strategy: %s", e)
+
+
+def backtest_strategy(strat: _Strategy, df: pd.DataFrame) -> list[dict]:
+    p = strat.precompute(df)
+    n = len(df["close"])
+    trades: list[dict] = []
+    open_pos: dict | None = None
+    sl_mult = strat.sl_mult
+    tp_mult = strat.tp_mult
+    close = df["close"]
+    high_arr = df["high"]
+    low_arr = df["low"]
+    start = 50
+    for i in range(start, n):
+        c = float(close.iloc[i])
+        h = float(high_arr.iloc[i])
+        l = float(low_arr.iloc[i])
+        atr_v = p["atr"].iloc[i] if "atr" in p else float("nan")
+        if pd.isna(atr_v) or atr_v <= 0:
+            continue
+        atr_v = float(atr_v)
+
+        if open_pos is not None:
+            d = open_pos["direction"]
+            entry = open_pos["entry"]
+            tp = open_pos["tp"]
+            sl = open_pos["sl"]
+            risk = open_pos["risk"]
+            if d == "LONG":
+                sl_hit = l <= sl
+                tp_hit = h >= tp
+            else:
+                sl_hit = h >= sl
+                tp_hit = l <= tp
+            if sl_hit:
+                trades.append({"direction": d, "entry": entry, "exit": sl,
+                               "rr": -1.0, "result": "loss"})
+                open_pos = None
+                continue
+            exits = strat.exit_reasons_at(p, i, d)
+            if exits:
+                if d == "LONG":
+                    rr = (c - entry) / risk
+                else:
+                    rr = (entry - c) / risk
+                trades.append({"direction": d, "entry": entry, "exit": c,
+                               "rr": rr, "result": "win" if rr > 0 else "loss"})
+                open_pos = None
+                continue
+            if tp_hit:
+                trades.append({"direction": d, "entry": entry, "exit": tp,
+                               "rr": tp_mult / sl_mult, "result": "win"})
+                open_pos = None
+                continue
+            continue
+
+        sig = strat.entry_signal_at(p, i)
+        if sig is None:
+            continue
+        risk = sl_mult * atr_v
+        if sig == "LONG":
+            tp_v = c + tp_mult * atr_v
+            sl_v = c - sl_mult * atr_v
+        else:
+            tp_v = c - tp_mult * atr_v
+            sl_v = c + sl_mult * atr_v
+        open_pos = {"direction": sig, "entry": c, "tp": tp_v,
+                    "sl": sl_v, "risk": risk}
+    return trades
+
+
+def handle_discover_command(reply_to_message_id: int | None = None) -> None:
+    global discover_running
+    with discover_lock:
+        if discover_running:
+            send_telegram("Discovery already in progress.",
+                          reply_to_message_id=reply_to_message_id)
+            return
+        discover_running = True
+    send_telegram(
+        "<b>Strategy discovery started</b>\n"
+        "Testing 10 well-known strategies on 6 months of 1H data across 20 pairs. "
+        "Pass = opt WR >= 60% AND val WR >= 55% AND >= 100 trades on opt window.",
+        reply_to_message_id=reply_to_message_id,
+    )
+    threading.Thread(
+        target=_run_discover, args=(reply_to_message_id, "discover"), daemon=True
+    ).start()
+
+
+def _run_discover(reply_to_message_id: int | None, group: str) -> None:
+    global active_strategy_id, discover_running
+    try:
+        strategies = [s for s in STRATEGIES if s.group == group]
+        if not strategies:
+            send_telegram(f"No strategies registered for {group}.",
+                          reply_to_message_id=reply_to_message_id)
+            return
+
+        log.info("%s: fetching 6mo data for %d pairs", group, len(PAIRS))
+        all_data = {}
+        for symbol in PAIRS:
+            try:
+                df = fetch_klines_paginated(symbol, "1h", target=4320)
+                if len(df) < 400:
+                    continue
+                all_data[symbol] = df
+            except Exception as e:
+                log.exception("%s %s fetch failed: %s", group, symbol, e)
+
+        if not all_data:
+            send_telegram(f"{group} failed: no pair data available.",
+                          reply_to_message_id=reply_to_message_id)
+            return
+
+        opt_data = {}
+        val_data = {}
+        opt_dates = []
+        val_dates = []
+        for sym, df in all_data.items():
+            split = (len(df) * 4) // 6
+            opt_data[sym] = df.iloc[:split].reset_index(drop=True)
+            val_data[sym] = df.iloc[split:].reset_index(drop=True)
+            opt_dates.append((opt_data[sym]["close_time"].iloc[0],
+                              opt_data[sym]["close_time"].iloc[-1]))
+            val_dates.append((val_data[sym]["close_time"].iloc[0],
+                              val_data[sym]["close_time"].iloc[-1]))
+        opt_start = min(d[0] for d in opt_dates)
+        opt_end = max(d[1] for d in opt_dates)
+        val_start = min(d[0] for d in val_dates)
+        val_end = max(d[1] for d in val_dates)
+
+        all_results = []
+        progress_every = 2 if group == "discover" else 10
+        for idx, strat in enumerate(strategies, 1):
+            opt_total = 0; opt_wins = 0
+            val_total = 0; val_wins = 0
+            for sym in opt_data:
+                try:
+                    t = backtest_strategy(strat, opt_data[sym])
+                    opt_total += len(t)
+                    opt_wins += sum(1 for x in t if x["result"] == "win")
+                except Exception as e:
+                    log.exception("%s opt %s/%s failed: %s", group, strat.id, sym, e)
+                try:
+                    t = backtest_strategy(strat, val_data[sym])
+                    val_total += len(t)
+                    val_wins += sum(1 for x in t if x["result"] == "win")
+                except Exception as e:
+                    log.exception("%s val %s/%s failed: %s", group, strat.id, sym, e)
+            opt_wr = (100 * opt_wins / opt_total) if opt_total else 0.0
+            val_wr = (100 * val_wins / val_total) if val_total else 0.0
+            overfit = abs(opt_wr - val_wr) > 15
+            passed = opt_wr >= 60 and val_wr >= 55 and opt_total >= 100
+            result = {
+                "idx": idx, "id": strat.id, "name": strat.name,
+                "opt_total": opt_total, "opt_wr": opt_wr,
+                "val_total": val_total, "val_wr": val_wr,
+                "overfit": overfit, "passed": passed,
+            }
+            all_results.append(result)
+            log.info(
+                "%s %d/%d %s: opt=%.1f%%(%d) val=%.1f%%(%d) %s",
+                group, idx, len(strategies), strat.id,
+                opt_wr, opt_total, val_wr, val_total,
+                "PASS" if passed else "fail",
+            )
+            if passed or idx % progress_every == 0 or idx == len(strategies):
+                tag = "<b>PASSED</b>" if passed else (
+                    "overfit" if overfit else "fail"
+                )
+                send_telegram(
+                    f"{group} {idx}/{len(strategies)} <b>{strat.name}</b>: "
+                    f"opt {opt_wr:.1f}% (n={opt_total}), "
+                    f"val {val_wr:.1f}% (n={val_total}) - {tag}",
+                    reply_to_message_id=reply_to_message_id,
+                )
+            if passed:
+                active_strategy_id = strat.id
+                save_strategy(strat.id, result)
+                send_telegram(
+                    f"<b>Winner: {strat.name}</b>\n"
+                    f"ID: {strat.id}\n"
+                    f"Opt: {opt_start.strftime('%Y-%m-%d')} -> "
+                    f"{opt_end.strftime('%Y-%m-%d')} | "
+                    f"Val: {val_start.strftime('%Y-%m-%d')} -> "
+                    f"{val_end.strftime('%Y-%m-%d')}\n"
+                    f"Opt WR: {opt_wr:.2f}% on {opt_total} trades\n"
+                    f"Val WR: {val_wr:.2f}% on {val_total} trades\n"
+                    f"<i>Activated for live scanning.</i>",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+
+        # No winner — pick best by combined avg
+        scored = [r for r in all_results if r["opt_total"] > 0]
+        if not scored:
+            send_telegram(f"{group} finished: no strategy produced trades.",
+                          reply_to_message_id=reply_to_message_id)
+            return
+        scored.sort(key=lambda r: (r["opt_wr"] + r["val_wr"]) / 2, reverse=True)
+        best = scored[0]
+        active_strategy_id = best["id"]
+        save_strategy(best["id"], best)
+        all_results.sort(key=lambda r: (r["opt_wr"] + r["val_wr"]) / 2, reverse=True)
+        lines = [
+            f"<b>{group} complete: no strategy met thresholds</b>",
+            f"Best by combined avg: <b>{best['name']}</b> "
+            f"(opt {best['opt_wr']:.1f}%, val {best['val_wr']:.1f}%) - activated",
+            "",
+            "<pre>",
+            f"{'#':<3}{'name':<30}{'opt%':>6}{'val%':>6}{'optN':>6}",
+        ]
+        for r in all_results[:30]:
+            n_short = r["name"][:29]
+            lines.append(
+                f"{r['idx']:<3}{n_short:<30}{r['opt_wr']:>5.1f}%"
+                f"{r['val_wr']:>5.1f}%{r['opt_total']:>6}"
+            )
+        lines.append("</pre>")
+        send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
+    except Exception as e:
+        log.exception("%s failed: %s", group, e)
+        send_telegram(f"<b>{group} failed</b>\n{e}",
+                      reply_to_message_id=reply_to_message_id)
+    finally:
+        with discover_lock:
+            discover_running = False
+
+
 _4h_trend_cache: dict[str, str] = {}
 _cache_lock = threading.Lock()
 
@@ -270,6 +1009,12 @@ def get_4h_trend(symbol: str) -> str:
 
 
 def evaluate(df: pd.DataFrame, symbol: str) -> dict:
+    sid = active_strategy_id
+    if sid and sid in STRATEGIES_BY_ID:
+        try:
+            return STRATEGIES_BY_ID[sid].evaluate(df, symbol)
+        except Exception as e:
+            log.exception("strategy %s evaluate failed, falling back: %s", sid, e)
     close = df["close"]
     high = df["high"]
     low = df["low"]
@@ -343,6 +1088,8 @@ def format_message(symbol: str, r: dict) -> str:
 
 
 def check_long_exit(r: dict) -> list[str]:
+    if "__strategy_long_exits" in r:
+        return r["__strategy_long_exits"]
     reasons = []
     rsi_overbought = params["rsi_overbought"]
     if r["rsi"] > rsi_overbought:
@@ -353,6 +1100,8 @@ def check_long_exit(r: dict) -> list[str]:
 
 
 def check_short_exit(r: dict) -> list[str]:
+    if "__strategy_short_exits" in r:
+        return r["__strategy_short_exits"]
     reasons = []
     rsi_oversold = params["rsi_oversold"]
     if r["rsi"] < rsi_oversold:
@@ -374,6 +1123,18 @@ def format_close_message(symbol: str, direction: str, r: dict, reasons: list[str
 
 
 def score_pair(df: pd.DataFrame, symbol: str) -> tuple[str, int]:
+    sid = active_strategy_id
+    if sid and sid in STRATEGIES_BY_ID:
+        try:
+            strat = STRATEGIES_BY_ID[sid]
+            p = strat.precompute(df)
+            n = len(df["close"])
+            ls, ss = strat.score_at(p, n - 1)
+            if ls >= ss:
+                return "LONG", int(ls)
+            return "SHORT", int(ss)
+        except Exception as e:
+            log.warning("score_pair %s failed: %s", sid, e)
     close = df["close"]
     high = df["high"]
     low = df["low"]
@@ -1118,6 +1879,8 @@ def telegram_poll_loop() -> None:
                     handle_backtest_command(msg.get("message_id"))
                 elif cmd == "/optimize":
                     handle_optimize_command(msg.get("message_id"))
+                elif cmd == "/discover":
+                    handle_discover_command(msg.get("message_id"))
         except Exception as e:
             log.warning("Telegram poll error: %s", e)
             time.sleep(5)
@@ -1183,6 +1946,7 @@ def main() -> None:
     log.info("binance-signal-bot starting (state path: %s)", STATE_PATH)
     load_state()
     load_params()
+    load_strategy()
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
