@@ -31,6 +31,7 @@ logging.basicConfig(
 log = logging.getLogger("binance-signal-bot")
 
 last_signal_by_pair: dict[str, str] = {}
+open_positions: dict[str, str] = {}
 
 
 def send_telegram(text: str) -> None:
@@ -97,15 +98,28 @@ def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     return (direction * volume).cumsum()
 
 
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
 def evaluate(df: pd.DataFrame) -> dict:
     close = df["close"]
     volume = df["volume"]
+    high = df["high"]
+    low = df["low"]
 
     ema100 = ema(close, 100)
     rsi14 = rsi(close, 14)
     macd_line, signal_line, _ = macd(close)
     obv_line = obv(close, volume)
     obv_ema = ema(obv_line, 20)
+    atr14 = atr(high, low, close, 14)
 
     price = close.iloc[-1]
     ema100_now = ema100.iloc[-1]
@@ -114,6 +128,7 @@ def evaluate(df: pd.DataFrame) -> dict:
     sig_now, sig_prev = signal_line.iloc[-1], signal_line.iloc[-2]
     obv_now = obv_line.iloc[-1]
     obv_ema_now = obv_ema.iloc[-1]
+    atr_now = atr14.iloc[-1]
 
     macd_cross_up = macd_prev <= sig_prev and macd_now > sig_now
     macd_cross_down = macd_prev >= sig_prev and macd_now < sig_now
@@ -140,20 +155,69 @@ def evaluate(df: pd.DataFrame) -> dict:
         "obv": float(obv_now),
         "obv_ema": float(obv_ema_now),
         "obv_trend": "bullish" if obv_bull else ("bearish" if obv_bear else "flat"),
+        "atr": float(atr_now),
+        "macd_cross_up": bool(macd_cross_up),
+        "macd_cross_down": bool(macd_cross_down),
+        "obv_bull": bool(obv_bull),
+        "obv_bear": bool(obv_bear),
         "candle_time": df["close_time"].iloc[-1],
     }
 
 
 def format_message(symbol: str, r: dict) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    price = r["price"]
+    atr_v = r["atr"]
+    if r["direction"] == "LONG":
+        tp = price + 2 * atr_v
+        sl = price - atr_v
+    else:
+        tp = price - 2 * atr_v
+        sl = price + atr_v
     return (
         f"<b>{r['direction']} signal: {symbol}</b>\n"
         f"Timeframe: {TIMEFRAME}\n"
-        f"Price: {r['price']:.6g}\n"
+        f"Price: {price:.6g}\n"
         f"EMA100: {r['ema100']:.6g}\n"
         f"RSI(14): {r['rsi']:.2f}\n"
         f"MACD: {r['macd']:.6g} | signal: {r['macd_signal']:.6g}\n"
         f"OBV trend: {r['obv_trend']}\n"
+        f"ATR(14): {atr_v:.6g}\n"
+        f"Take Profit: {tp:.6g}\n"
+        f"Stop Loss: {sl:.6g}\n"
+        f"Time: {ts}"
+    )
+
+
+def check_long_exit(r: dict) -> list[str]:
+    reasons = []
+    if r["macd_cross_down"]:
+        reasons.append("MACD crossed below signal")
+    if r["rsi"] > 70:
+        reasons.append(f"RSI overbought ({r['rsi']:.2f})")
+    if r["obv_bear"]:
+        reasons.append("OBV dropped below EMA")
+    return reasons
+
+
+def check_short_exit(r: dict) -> list[str]:
+    reasons = []
+    if r["macd_cross_up"]:
+        reasons.append("MACD crossed above signal")
+    if r["rsi"] < 30:
+        reasons.append(f"RSI oversold ({r['rsi']:.2f})")
+    if r["obv_bull"]:
+        reasons.append("OBV rose above EMA")
+    return reasons
+
+
+def format_close_message(symbol: str, direction: str, r: dict, reasons: list[str]) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return (
+        f"<b>CLOSE {direction}: {symbol}</b>\n"
+        f"Timeframe: {TIMEFRAME}\n"
+        f"Price: {r['price']:.6g}\n"
+        f"Trigger: {'; '.join(reasons)}\n"
         f"Time: {ts}"
     )
 
@@ -167,6 +231,21 @@ def scan_once() -> None:
                 log.warning("%s: not enough candles (%d)", symbol, len(df))
                 continue
             result = evaluate(df)
+
+            position = open_positions.get(symbol)
+            if position == "LONG":
+                reasons = check_long_exit(result)
+                if reasons:
+                    send_telegram(format_close_message(symbol, "LONG", result, reasons))
+                    open_positions.pop(symbol, None)
+                    log.info("%s: CLOSE LONG sent (%s)", symbol, "; ".join(reasons))
+            elif position == "SHORT":
+                reasons = check_short_exit(result)
+                if reasons:
+                    send_telegram(format_close_message(symbol, "SHORT", result, reasons))
+                    open_positions.pop(symbol, None)
+                    log.info("%s: CLOSE SHORT sent (%s)", symbol, "; ".join(reasons))
+
             direction = result["direction"]
             if direction is None:
                 continue
@@ -174,6 +253,7 @@ def scan_once() -> None:
                 log.info("%s: duplicate %s signal, skipping", symbol, direction)
                 continue
             last_signal_by_pair[symbol] = direction
+            open_positions[symbol] = direction
             msg = format_message(symbol, result)
             send_telegram(msg)
             log.info("%s: %s signal sent", symbol, direction)
