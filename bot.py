@@ -712,6 +712,13 @@ def _w9_score(p, i):
 # Override score_at on the registered Williams %R instance.
 # Assigning a plain function bypasses descriptor binding so no `self` is needed.
 STRATEGIES_BY_ID["d9_williams_r"].score_at = lambda p, i: _w9_score(p, i)
+STRATEGIES_BY_ID["d9_williams_r"].backtest_wr = 61.3
+STRATEGIES_BY_ID["d9_williams_r"].score_description = [
+    "40 pts: W%R is in the extreme zone (below -80 for LONG, above -20 for SHORT)",
+    "25 pts: W%R crossed the threshold within the last 2 candles (fresh signal)",
+    "20 pts: W%R is turning in the reversal direction (rising for LONG, falling for SHORT)",
+    "15 pts: ATR is at least 0.3% of current price (sufficient volatility to trade)",
+]
 
 
 def _s10_pre(df):
@@ -3454,11 +3461,30 @@ def handle_check_command(reply_to_message_id: int | None = None) -> None:
 
     rankings.sort(key=lambda x: x[2], reverse=True)
     ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S MYT")
-    lines = [f"<b>Confluence check — {ts}</b>", ""]
+    lines = [f"<b>Confluence check — {ts}</b>"]
+
+    active = None
+    sid = active_strategy_id
+    if sid and sid in STRATEGIES_BY_ID:
+        active = STRATEGIES_BY_ID[sid]
+    if active is not None:
+        wr = getattr(active, "backtest_wr", None)
+        wr_str = f" | Backtest WR: {wr:.1f}%" if wr is not None else ""
+        lines.append(f"Strategy: {active.name}{wr_str}")
+    lines.append("")
+
     for symbol, direction, score in rankings:
         filled = round(score / 10)
         bar = "█" * filled + "░" * (10 - filled)
         lines.append(f"{symbol} {direction} {score}% {bar}")
+
+    descriptions = getattr(active, "score_description", None) if active else None
+    if descriptions:
+        lines.append("")
+        lines.append("<b>Score breakdown:</b>")
+        for d in descriptions:
+            lines.append(f"• {d}")
+
     lines.append("")
     lines.append("<i>100% = a live signal would fire right now.</i>")
     send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
