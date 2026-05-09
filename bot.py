@@ -435,7 +435,7 @@ def handle_check_command(reply_to_message_id: int | None = None) -> None:
     log.info("/check reply sent (%d pairs)", len(rankings))
 
 
-def backtest_pair(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> list[dict]:
+def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> tuple[list[dict], dict]:
     close = df_1h["close"]
     high_arr = df_1h["high"]
     low_arr = df_1h["low"]
@@ -456,6 +456,12 @@ def backtest_pair(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> list[dict]:
     n = len(df_1h)
     trades: list[dict] = []
     open_pos: dict | None = None
+    debug = {
+        "candles_evaluated": 0,
+        "conditions_met_sum": 0,
+        "rejected_by_4h_only": 0,
+        "fired_conditions_sum": 0,
+    }
 
     for i in range(100, n):
         c = float(close.iloc[i])
@@ -536,25 +542,50 @@ def backtest_pair(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> list[dict]:
         obv_bull = obv_cur > obv_ema_cur
         obv_bear = obv_cur < obv_ema_cur
         volume_ok = vol_cur >= 1.2 * vol_sma_cur
-        trend_up = c > float(ema100_4h_now)
-        trend_down = c < float(ema100_4h_now)
+        ema4h = float(ema100_4h_now)
+        trend_up = c > ema4h
+        trend_down = c < ema4h
 
-        if (c > ema100_now and trend_up and cross_up and hist_growing_up
-                and rsi_long_ok and obv_bull and volume_ok):
+        c_long = [c > ema100_now, trend_up, cross_up, hist_growing_up,
+                  rsi_long_ok, obv_bull, volume_ok]
+        c_short = [c < ema100_now, trend_down, cross_down, hist_growing_down,
+                   rsi_short_ok, obv_bear, volume_ok]
+        long_count = sum(c_long)
+        short_count = sum(c_short)
+        debug["candles_evaluated"] += 1
+        debug["conditions_met_sum"] += max(long_count, short_count)
+
+        if c_long[0] and not c_long[1] and all(c_long[2:]):
+            debug["rejected_by_4h_only"] += 1
+        if c_short[0] and not c_short[1] and all(c_short[2:]):
+            debug["rejected_by_4h_only"] += 1
+
+        if all(c_long):
             risk = 1.5 * atr_cur
             open_pos = {
                 "direction": "LONG", "entry": c,
                 "tp": c + 3 * atr_cur, "sl": c - 1.5 * atr_cur, "risk": risk,
             }
-        elif (c < ema100_now and trend_down and cross_down and hist_growing_down
-                and rsi_short_ok and obv_bear and volume_ok):
+            debug["fired_conditions_sum"] += long_count
+            log.info(
+                "backtest %s LONG entry @ %.6g | ema1h=Y trend4h=up(price=%.6g vs ema4h=%.6g) "
+                "macd_cross=Y hist_grow=Y rsi=%.2f obv=bull vol=%.2fx",
+                symbol, c, c, ema4h, rsi_cur, vol_cur / vol_sma_cur if vol_sma_cur else 0.0,
+            )
+        elif all(c_short):
             risk = 1.5 * atr_cur
             open_pos = {
                 "direction": "SHORT", "entry": c,
                 "tp": c - 3 * atr_cur, "sl": c + 1.5 * atr_cur, "risk": risk,
             }
+            debug["fired_conditions_sum"] += short_count
+            log.info(
+                "backtest %s SHORT entry @ %.6g | ema1h=Y trend4h=down(price=%.6g vs ema4h=%.6g) "
+                "macd_cross=Y hist_grow=Y rsi=%.2f obv=bear vol=%.2fx",
+                symbol, c, c, ema4h, rsi_cur, vol_cur / vol_sma_cur if vol_sma_cur else 0.0,
+            )
 
-    return trades
+    return trades, debug
 
 
 def handle_backtest_command(reply_to_message_id: int | None = None) -> None:
@@ -575,6 +606,12 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
         results: list[dict] = []
         date_min = None
         date_max = None
+        agg_debug = {
+            "candles_evaluated": 0,
+            "conditions_met_sum": 0,
+            "rejected_by_4h_only": 0,
+            "fired_conditions_sum": 0,
+        }
         for symbol in PAIRS:
             try:
                 df_1h = fetch_klines_paginated(symbol, "1h", target=2160)
@@ -588,7 +625,9 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
                 date_min = first_ct if date_min is None or first_ct < date_min else date_min
                 date_max = last_ct if date_max is None or last_ct > date_max else date_max
 
-                trades = backtest_pair(df_1h, df_4h)
+                trades, debug = backtest_pair(symbol, df_1h, df_4h)
+                for k in agg_debug:
+                    agg_debug[k] += debug[k]
                 wins = sum(1 for t in trades if t["result"] == "win")
                 losses = sum(1 for t in trades if t["result"] == "loss")
                 total = len(trades)
@@ -598,8 +637,15 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
                     "symbol": symbol, "total": total, "wins": wins,
                     "losses": losses, "wr": wr, "avg_rr": avg_rr,
                 })
-                log.info("backtest %s: %d trades, %.1f%% WR, avg RR %+.2f",
-                         symbol, total, wr, avg_rr)
+                log.info(
+                    "backtest %s: %d trades, %.1f%% WR, avg RR %+.2f | "
+                    "candles=%d, avg_conds=%.2f/7, 4h_rejections=%d",
+                    symbol, total, wr, avg_rr,
+                    debug["candles_evaluated"],
+                    debug["conditions_met_sum"] / debug["candles_evaluated"]
+                    if debug["candles_evaluated"] else 0.0,
+                    debug["rejected_by_4h_only"],
+                )
             except Exception as e:
                 log.exception("backtest %s failed: %s", symbol, e)
 
@@ -626,11 +672,31 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
         lines.append(
             f"<b>Overall:</b> {total_w}/{total_t} wins = {overall_wr:.1f}% across all pairs"
         )
+
+        lines.append("")
+        lines.append("<b>DEBUG</b>")
+        avg_fired = (
+            agg_debug["fired_conditions_sum"] / total_t if total_t else 0.0
+        )
+        avg_evaluated = (
+            agg_debug["conditions_met_sum"] / agg_debug["candles_evaluated"]
+            if agg_debug["candles_evaluated"] else 0.0
+        )
+        lines.append(f"Avg conditions met per fired signal: {avg_fired:.2f} / 7")
+        lines.append(f"Avg conditions met per evaluated candle: {avg_evaluated:.2f} / 7")
+        lines.append(f"Candles evaluated for entry: {agg_debug['candles_evaluated']:,}")
+        lines.append(f"Trades rejected by 4H filter alone: {agg_debug['rejected_by_4h_only']:,}")
+
         lines.append("")
         lines.append("<i>Past performance does not guarantee future results.</i>")
 
         send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
-        log.info("Backtest complete: %d total trades, %.1f%% overall WR", total_t, overall_wr)
+        log.info(
+            "Backtest complete: %d total trades, %.1f%% overall WR, "
+            "avg_fired=%.2f, avg_eval=%.2f, 4h_rejections=%d",
+            total_t, overall_wr, avg_fired, avg_evaluated,
+            agg_debug["rejected_by_4h_only"],
+        )
     except Exception as e:
         log.exception("backtest failed: %s", e)
         send_telegram(
