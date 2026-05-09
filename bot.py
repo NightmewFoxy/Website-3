@@ -823,9 +823,9 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame | None =
 def handle_backtest_command(reply_to_message_id: int | None = None) -> None:
     log.info("Processing /backtest command")
     send_telegram(
-        "<b>Backtest started</b>\n"
-        "Fetching ~3 months of 1H data for 20 pairs and simulating the mean-reversion strategy. "
-        "Results will arrive in a few minutes.",
+        "<b>Backtest started (backtesting.py engine)</b>\n"
+        "Running BTCUSDT 6-month POC first. If Sharpe > 1.0 and Expectancy > 0, "
+        "will expand to all 20 pairs. Otherwise stops and reports POC stats.",
         reply_to_message_id=reply_to_message_id,
     )
     threading.Thread(
@@ -833,128 +833,274 @@ def handle_backtest_command(reply_to_message_id: int | None = None) -> None:
     ).start()
 
 
+def _klines_to_bt_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df[["close_time", "open", "high", "low", "close", "volume"]].copy()
+    out = out.rename(columns={
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume",
+    })
+    out = out.set_index("close_time")
+    out.index = pd.DatetimeIndex(out.index).tz_convert(None)
+    return out[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def _build_mean_reversion_strategy():
+    from backtesting import Strategy
+
+    class MeanReversionStrategy(Strategy):
+        bb_std = 2.0
+        sl_mult = 1.0
+        tp_mult = 1.5
+
+        def init(self):
+            close = pd.Series(self.data.Close)
+            high = pd.Series(self.data.High)
+            low = pd.Series(self.data.Low)
+            volume = pd.Series(self.data.Volume)
+
+            self.rsi14 = self.I(lambda: rsi(close, 14).values, name="RSI14")
+            bb_u, bb_m, bb_l = compute_bollinger_bands(close, 20, self.bb_std)
+            self.bb_upper = self.I(lambda: bb_u.values, name="BB_upper")
+            self.bb_middle = self.I(lambda: bb_m.values, name="BB_middle")
+            self.bb_lower = self.I(lambda: bb_l.values, name="BB_lower")
+            self.ema50_arr = self.I(lambda: ema(close, 50).values, name="EMA50")
+            self.atr14 = self.I(lambda: atr(high, low, close, 14).values, name="ATR14")
+            self.stoch_rsi = self.I(
+                lambda: compute_stoch_rsi(close, 14, 14).values, name="StochRSI"
+            )
+            obv_line = obv(close, volume)
+            self.obv_arr = self.I(lambda: obv_line.values, name="OBV")
+            self.obv_ema_arr = self.I(lambda: ema(obv_line, 20).values, name="OBV_EMA")
+
+        def next(self):
+            n = len(self.data.Close)
+            if n < 60:
+                return
+
+            price = float(self.data.Close[-1])
+            atr_val = float(self.atr14[-1])
+            if np.isnan(atr_val):
+                return
+
+            if self.position:
+                rsi_now = float(self.rsi14[-1])
+                bb_mid = float(self.bb_middle[-1])
+                obv_n = float(self.obv_arr[-1])
+                obv_e = float(self.obv_ema_arr[-1])
+
+                if self.position.is_long:
+                    conds = [rsi_now > 60, price >= bb_mid, obv_n < obv_e]
+                    if sum(bool(c) for c in conds) >= 2:
+                        self.position.close()
+                else:
+                    conds = [rsi_now < 40, price <= bb_mid, obv_n > obv_e]
+                    if sum(bool(c) for c in conds) >= 2:
+                        self.position.close()
+                return
+
+            if atr_val < 0.003 * price:
+                return
+
+            rsi_now = float(self.rsi14[-1])
+            bb_lower_now = float(self.bb_lower[-1])
+            bb_upper_now = float(self.bb_upper[-1])
+            ema50_now = float(self.ema50_arr[-1])
+            ema50_back = float(self.ema50_arr[-4]) if n >= 4 else float("nan")
+            stoch_now = float(self.stoch_rsi[-1])
+            stoch_prev = float(self.stoch_rsi[-2]) if n >= 2 else float("nan")
+            if any(np.isnan(x) for x in (rsi_now, bb_lower_now, bb_upper_now,
+                                          ema50_now, ema50_back, stoch_now, stoch_prev)):
+                return
+
+            slope = ema50_now - ema50_back
+            slope_flat = abs(slope) < 0.0015 * price
+
+            rsi_recent_low = any(
+                n >= k and not np.isnan(self.rsi14[-k]) and float(self.rsi14[-k]) < 30
+                for k in (1, 2, 3)
+            )
+            rsi_recent_high = any(
+                n >= k and not np.isnan(self.rsi14[-k]) and float(self.rsi14[-k]) > 70
+                for k in (1, 2, 3)
+            )
+            bb_long_touch = any(
+                n >= k and not np.isnan(self.bb_lower[-k])
+                and float(self.data.Low[-k]) <= float(self.bb_lower[-k])
+                for k in (1, 2, 3)
+            )
+            bb_short_touch = any(
+                n >= k and not np.isnan(self.bb_upper[-k])
+                and float(self.data.High[-k]) >= float(self.bb_upper[-k])
+                for k in (1, 2, 3)
+            )
+            near_lower = abs(price - bb_lower_now) <= 0.002 * price
+            near_upper = abs(price - bb_upper_now) <= 0.002 * price
+
+            c1_long = (rsi_now < 35) or rsi_recent_low
+            c2_long = bb_long_touch or near_lower
+            c3_long = stoch_now < 20 and stoch_now > stoch_prev
+            c4_long = slope_flat
+
+            c1_short = (rsi_now > 65) or rsi_recent_high
+            c2_short = bb_short_touch or near_upper
+            c3_short = stoch_now > 80 and stoch_now < stoch_prev
+            c4_short = slope_flat
+
+            if c1_long and c2_long and c3_long and c4_long:
+                tp = price + self.tp_mult * atr_val
+                sl = price - self.sl_mult * atr_val
+                self.buy(sl=sl, tp=tp)
+            elif c1_short and c2_short and c3_short and c4_short:
+                tp = price - self.tp_mult * atr_val
+                sl = price + self.sl_mult * atr_val
+                self.sell(sl=sl, tp=tp)
+
+    return MeanReversionStrategy
+
+
+def _run_pair_library_backtest(symbol: str) -> dict | None:
+    from backtesting import Backtest
+
+    df = fetch_klines_paginated(symbol, "1h", target=4320)
+    if len(df) < 200:
+        log.warning("backtest %s: insufficient data (%d)", symbol, len(df))
+        return None
+
+    bt_df = _klines_to_bt_df(df)
+    Strategy = _build_mean_reversion_strategy()
+    bt = Backtest(
+        bt_df, Strategy,
+        cash=10000, commission=0.001, exclusive_orders=True,
+    )
+    stats = bt.run(
+        bb_std=params["bb_std"],
+        sl_mult=params["sl_mult"],
+        tp_mult=params["tp_mult"],
+    )
+
+    def _f(key, default=0.0):
+        v = stats.get(key, default)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return default
+        if v != v:  # NaN
+            return default
+        return v
+
+    return {
+        "symbol": symbol,
+        "trades": int(_f("# Trades", 0)),
+        "wr": _f("Win Rate [%]"),
+        "sharpe": _f("Sharpe Ratio"),
+        "max_dd": _f("Max. Drawdown [%]"),
+        "expectancy": _f("Expectancy [%]"),
+        "ret": _f("Return [%]"),
+        "sqn": _f("SQN"),
+        "start": str(bt_df.index[0].date()),
+        "end": str(bt_df.index[-1].date()),
+    }
+
+
 def _run_backtest(reply_to_message_id: int | None) -> None:
     try:
-        results: list[dict] = []
-        date_min = None
-        date_max = None
-        agg_debug = {
-            "candles_evaluated": 0,
-            "conditions_met_sum": 0,
-            "rejected_by_4h_only": 0,
-            "fired_conditions_sum": 0,
-            "fired_c1": 0,
-            "fired_c2": 0,
-            "fired_c3": 0,
-            "fired_c4": 0,
-            "eval_c1": 0,
-            "eval_c2": 0,
-            "eval_c3": 0,
-            "eval_c4": 0,
-            "atr_too_low": 0,
-        }
-        for symbol in PAIRS:
-            try:
-                df_1h = fetch_klines_paginated(symbol, "1h", target=2160)
-                if len(df_1h) < 200:
-                    log.warning("backtest %s: insufficient 1h data (%d)", symbol, len(df_1h))
-                    continue
-                first_ct = df_1h["close_time"].iloc[0]
-                last_ct = df_1h["close_time"].iloc[-1]
-                date_min = first_ct if date_min is None or first_ct < date_min else date_min
-                date_max = last_ct if date_max is None or last_ct > date_max else date_max
+        log.info("library backtest: starting BTCUSDT POC")
+        btc = _run_pair_library_backtest("BTCUSDT")
+        if btc is None:
+            send_telegram(
+                "Library backtest aborted: insufficient BTCUSDT data.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
 
-                trades, debug = backtest_pair(symbol, df_1h)
-                for k in agg_debug:
-                    agg_debug[k] += debug[k]
-                wins = sum(1 for t in trades if t["result"] == "win")
-                losses = sum(1 for t in trades if t["result"] == "loss")
-                total = len(trades)
-                wr = (100.0 * wins / total) if total else 0.0
-                avg_rr = (sum(t["rr"] for t in trades) / total) if total else 0.0
-                results.append({
-                    "symbol": symbol, "total": total, "wins": wins,
-                    "losses": losses, "wr": wr, "avg_rr": avg_rr,
-                })
+        poc_msg = (
+            "<b>Library backtest POC: BTCUSDT</b>\n"
+            f"Range: {btc['start']} -> {btc['end']}\n"
+            f"Trades: {btc['trades']}\n"
+            f"Win Rate: {btc['wr']:.2f}%\n"
+            f"Sharpe Ratio: {btc['sharpe']:.2f}\n"
+            f"Max Drawdown: {btc['max_dd']:.2f}%\n"
+            f"Expectancy: {btc['expectancy']:+.3f}%\n"
+            f"Return: {btc['ret']:+.2f}%\n"
+            f"SQN: {btc['sqn']:.2f}"
+        )
+        send_telegram(poc_msg, reply_to_message_id=reply_to_message_id)
+        log.info(
+            "POC: trades=%d wr=%.2f sharpe=%.2f exp=%.3f maxdd=%.2f",
+            btc["trades"], btc["wr"], btc["sharpe"], btc["expectancy"], btc["max_dd"],
+        )
+
+        passes = btc["sharpe"] > 1.0 and btc["expectancy"] > 0
+        if not passes:
+            why = []
+            if btc["sharpe"] <= 1.0:
+                why.append(f"Sharpe {btc['sharpe']:.2f} <= 1.0")
+            if btc["expectancy"] <= 0:
+                why.append(f"Expectancy {btc['expectancy']:+.3f}% <= 0")
+            send_telegram(
+                "POC did not meet thresholds (" + "; ".join(why) + "). "
+                "Reporting stats as is, awaiting further instructions.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        send_telegram(
+            "POC passed (Sharpe > 1.0 AND Expectancy > 0). "
+            "Expanding to all 20 pairs - this takes a few minutes.",
+            reply_to_message_id=reply_to_message_id,
+        )
+
+        all_results: list[dict] = [btc]
+        for symbol in PAIRS:
+            if symbol == "BTCUSDT":
+                continue
+            try:
+                r = _run_pair_library_backtest(symbol)
+                if r is None:
+                    continue
+                all_results.append(r)
                 log.info(
-                    "backtest %s: %d trades, %.1f%% WR, avg RR %+.2f | candles=%d, avg_conds=%.2f/5",
-                    symbol, total, wr, avg_rr,
-                    debug["candles_evaluated"],
-                    debug["conditions_met_sum"] / debug["candles_evaluated"]
-                    if debug["candles_evaluated"] else 0.0,
+                    "backtest %s: trades=%d wr=%.2f sharpe=%.2f exp=%.3f",
+                    symbol, r["trades"], r["wr"], r["sharpe"], r["expectancy"],
                 )
             except Exception as e:
                 log.exception("backtest %s failed: %s", symbol, e)
 
-        results.sort(key=lambda x: (x["wr"], x["total"]), reverse=True)
+        all_results.sort(key=lambda r: r["sharpe"], reverse=True)
+        total_trades = sum(r["trades"] for r in all_results)
+        wr_weighted = (
+            sum(r["wr"] * r["trades"] for r in all_results) / total_trades
+            if total_trades else 0.0
+        )
+        sharpe_avg = sum(r["sharpe"] for r in all_results) / len(all_results)
+        exp_avg = sum(r["expectancy"] for r in all_results) / len(all_results)
+        ret_total = sum(r["ret"] for r in all_results)
 
-        lines = ["<b>Backtest results</b>"]
-        if date_min is not None and date_max is not None:
-            lines.append(
-                f"Range: {date_min.strftime('%Y-%m-%d')} -> {date_max.strftime('%Y-%m-%d')}"
-            )
-        lines.append("")
+        lines = ["<b>20-pair library backtest complete</b>"]
         lines.append("<pre>")
-        lines.append(f"{'Pair':<10}{'T':>4}{'W':>4}{'L':>4}{'WR%':>7}{'avgRR':>8}")
-        for r in results:
+        lines.append(
+            f"{'Pair':<10}{'T':>4}{'WR%':>7}{'Shrp':>7}{'DD%':>7}{'Exp%':>8}{'Ret%':>8}"
+        )
+        for r in all_results:
             lines.append(
-                f"{r['symbol']:<10}{r['total']:>4}{r['wins']:>4}{r['losses']:>4}"
-                f"{r['wr']:>6.1f}%{r['avg_rr']:>+8.2f}"
+                f"{r['symbol']:<10}{r['trades']:>4}"
+                f"{r['wr']:>6.1f}%{r['sharpe']:>7.2f}"
+                f"{r['max_dd']:>6.1f}%{r['expectancy']:>+7.2f}%{r['ret']:>+7.2f}%"
             )
         lines.append("</pre>")
-
-        total_t = sum(r["total"] for r in results)
-        total_w = sum(r["wins"] for r in results)
-        overall_wr = (100.0 * total_w / total_t) if total_t else 0.0
-        lines.append(
-            f"<b>Overall:</b> {total_w}/{total_t} wins = {overall_wr:.1f}% across all pairs"
-        )
-
         lines.append("")
-        lines.append("<b>DEBUG</b>")
-        avg_fired = (
-            agg_debug["fired_conditions_sum"] / total_t if total_t else 0.0
-        )
-        avg_evaluated = (
-            agg_debug["conditions_met_sum"] / agg_debug["candles_evaluated"]
-            if agg_debug["candles_evaluated"] else 0.0
-        )
-        lines.append(f"Avg conditions met per fired signal: {avg_fired:.2f} / 4")
-        lines.append(f"Avg conditions met per evaluated candle: {avg_evaluated:.2f} / 4")
-        lines.append(f"Candles evaluated for entry: {agg_debug['candles_evaluated']:,}")
-        evals = max(agg_debug['candles_evaluated'], 1)
-        lines.append(
-            f"Per-condition true on evaluated candles: "
-            f"c1 RSI extreme {agg_debug['eval_c1']:,} ({100*agg_debug['eval_c1']/evals:.1f}%), "
-            f"c2 BB touch/near {agg_debug['eval_c2']:,} ({100*agg_debug['eval_c2']/evals:.1f}%), "
-            f"c3 StochRSI extreme {agg_debug['eval_c3']:,} ({100*agg_debug['eval_c3']/evals:.1f}%), "
-            f"c4 slope flat {agg_debug['eval_c4']:,} ({100*agg_debug['eval_c4']/evals:.1f}%)"
-        )
-        lines.append(
-            f"ATR too low (skipped): {agg_debug['atr_too_low']:,} candles "
-            f"({100*agg_debug['atr_too_low']/evals:.1f}%)"
-        )
-        lines.append(
-            f"Per-condition fires within {total_t} entries: "
-            f"c1 {agg_debug['fired_c1']}, "
-            f"c2 {agg_debug['fired_c2']}, "
-            f"c3 {agg_debug['fired_c3']}, "
-            f"c4 {agg_debug['fired_c4']}"
-        )
-
+        lines.append(f"Total trades: {total_trades}")
+        lines.append(f"Weighted win rate: {wr_weighted:.2f}%")
+        lines.append(f"Average Sharpe: {sharpe_avg:.2f}")
+        lines.append(f"Average expectancy: {exp_avg:+.3f}%")
+        lines.append(f"Sum of returns: {ret_total:+.2f}%")
         lines.append("")
         lines.append("<i>Past performance does not guarantee future results.</i>")
-
         send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
-        log.info(
-            "Backtest complete: %d total trades, %.1f%% overall WR, "
-            "avg_fired=%.2f, avg_eval=%.2f",
-            total_t, overall_wr, avg_fired, avg_evaluated,
-        )
     except Exception as e:
-        log.exception("backtest failed: %s", e)
+        log.exception("library backtest failed: %s", e)
         send_telegram(
-            f"<b>Backtest failed</b>\n{e}",
+            f"<b>Library backtest failed</b>\n{e}",
             reply_to_message_id=reply_to_message_id,
         )
 
