@@ -721,6 +721,509 @@ STRATEGIES_BY_ID["d2_bb_squeeze"]._precompute = _s2_pre_v2
 STRATEGIES_BY_ID["d2_bb_squeeze"]._signal = _s2_sig_final
 
 
+# ===== /discover2 batch 1: strategies 1-25 =====
+
+def _wma(s: pd.Series, period: int) -> pd.Series:
+    weights = np.arange(1, period + 1, dtype=float)
+    wsum = weights.sum()
+    return s.rolling(period).apply(
+        lambda x: float(np.dot(x, weights) / wsum) if not np.any(np.isnan(x)) else float("nan"),
+        raw=True,
+    )
+
+
+def _roc(s: pd.Series, period: int) -> pd.Series:
+    return 100 * (s - s.shift(period)) / s.shift(period).replace(0, np.nan)
+
+
+def _crosses(prev_a, cur_a, prev_b, cur_b, direction="up"):
+    if any(pd.isna(x) for x in (prev_a, cur_a, prev_b, cur_b)):
+        return False
+    if direction == "up":
+        return prev_a <= prev_b and cur_a > cur_b
+    return prev_a >= prev_b and cur_a < cur_b
+
+
+# 1. Chandelier Exit
+def _d2s1_pre(df):
+    a = atr(df["high"], df["low"], df["close"], 22)
+    hh = df["high"].rolling(22).max()
+    ll = df["low"].rolling(22).min()
+    return {
+        "atr": a, "long_stop": hh - 3 * a, "short_stop": ll + 3 * a,
+        "close": df["close"],
+    }
+def _d2s1_sig(p, i):
+    if i < 1: return None
+    cp = p["close"].iloc[i-1]; cc = p["close"].iloc[i]
+    lsp = p["long_stop"].iloc[i-1]; lsc = p["long_stop"].iloc[i]
+    ssp = p["short_stop"].iloc[i-1]; ssc = p["short_stop"].iloc[i]
+    if any(pd.isna(x) for x in (cp, cc, lsp, lsc, ssp, ssc)): return None
+    if cp <= lsp and cc > lsc: return "LONG"
+    if cp >= ssp and cc < ssc: return "SHORT"
+    return None
+_register("e1_chandelier", "Chandelier Exit", _d2s1_pre, _d2s1_sig, None, group="discover2")
+
+
+# 2. Keltner Channel reversion
+def _d2s2_pre(df):
+    em = ema(df["close"], 20)
+    a = atr(df["high"], df["low"], df["close"], 14)
+    return {"ema20": em, "atr": a, "kc_upper": em + 2 * a, "kc_lower": em - 2 * a, "close": df["close"]}
+def _d2s2_sig(p, i):
+    c = p["close"].iloc[i]; u = p["kc_upper"].iloc[i]; l = p["kc_lower"].iloc[i]
+    if any(pd.isna(x) for x in (c, u, l)): return None
+    if c < l: return "LONG"
+    if c > u: return "SHORT"
+    return None
+def _d2s2_exit(p, i, d):
+    c = p["close"].iloc[i]; m = p["ema20"].iloc[i]
+    if pd.isna(c) or pd.isna(m): return False
+    if d == "LONG" and c >= m: return "Reached EMA20"
+    if d == "SHORT" and c <= m: return "Reached EMA20"
+    return False
+_register("e2_keltner", "Keltner Channel Reversion", _d2s2_pre, _d2s2_sig, _d2s2_exit, group="discover2")
+
+
+# 3. Elder Ray
+def _d2s3_pre(df):
+    em = ema(df["close"], 13)
+    return {"ema13": em, "bull": df["high"] - em, "bear": df["low"] - em}
+def _d2s3_sig(p, i):
+    if i < 2: return None
+    em = p["ema13"]; bear = p["bear"]; bull = p["bull"]
+    if any(pd.isna(x) for x in (em.iloc[i], em.iloc[i-1], bear.iloc[i], bear.iloc[i-1])):
+        return None
+    em_rising = em.iloc[i] > em.iloc[i-1]
+    em_falling = em.iloc[i] < em.iloc[i-1]
+    bear_rising_neg = bear.iloc[i] < 0 and bear.iloc[i] > bear.iloc[i-1]
+    bull_falling_pos = bull.iloc[i] > 0 and bull.iloc[i] < bull.iloc[i-1]
+    if em_rising and bear_rising_neg: return "LONG"
+    if em_falling and bull_falling_pos: return "SHORT"
+    return None
+_register("e3_elder_ray", "Elder Ray", _d2s3_pre, _d2s3_sig, None, group="discover2")
+
+
+# 4. Coppock Curve
+def _d2s4_pre(df):
+    rc = _roc(df["close"], 14) + _roc(df["close"], 11)
+    return {"coppock": _wma(rc, 10)}
+def _d2s4_sig(p, i):
+    if i < 1: return None
+    cp = p["coppock"].iloc[i-1]; cc = p["coppock"].iloc[i]
+    if pd.isna(cp) or pd.isna(cc): return None
+    if cp <= 0 and cc > 0: return "LONG"
+    if cp >= 0 and cc < 0: return "SHORT"
+    return None
+_register("e4_coppock", "Coppock Curve", _d2s4_pre, _d2s4_sig, None, group="discover2")
+
+
+# 5. Detrended Price Oscillator
+def _d2s5_pre(df, period=20):
+    shift = period // 2 + 1
+    sma = df["close"].rolling(period).mean()
+    return {"dpo": df["close"] - sma.shift(shift)}
+def _d2s5_sig(p, i):
+    if i < 1: return None
+    pp = p["dpo"].iloc[i-1]; pc = p["dpo"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0 and pc > 0: return "LONG"
+    if pp >= 0 and pc < 0: return "SHORT"
+    return None
+_register("e5_dpo", "Detrended Price Oscillator", _d2s5_pre, _d2s5_sig, None, group="discover2")
+
+
+# 6. Mass Index
+def _d2s6_pre(df):
+    rng = df["high"] - df["low"]
+    e1 = ema(rng, 9); e2 = ema(e1, 9)
+    ratio = e1 / e2.replace(0, np.nan)
+    mi = ratio.rolling(25).sum()
+    em9 = ema(df["close"], 9)
+    return {"mi": mi, "ema9": em9}
+def _d2s6_sig(p, i):
+    if i < 5: return None
+    mi = p["mi"]; em = p["ema9"]
+    cur = mi.iloc[i]
+    if pd.isna(cur): return None
+    # need any of last 5 to have been > 27
+    spike = any(pd.notna(mi.iloc[i-k]) and mi.iloc[i-k] > 27 for k in (1, 2, 3, 4, 5))
+    if not spike: return None
+    if cur >= 26.5: return None
+    if pd.isna(em.iloc[i]) or pd.isna(em.iloc[i-1]): return None
+    em_up = em.iloc[i] > em.iloc[i-1]
+    if em_up: return "LONG"
+    return "SHORT"
+_register("e6_mass_index", "Mass Index", _d2s6_pre, _d2s6_sig, None, group="discover2")
+
+
+# 7. Vortex Indicator
+def _d2s7_pre(df, period=14):
+    h = df["high"]; l = df["low"]; c = df["close"]
+    tr = pd.concat([(h - l), (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
+    vmp = (h - l.shift(1)).abs()
+    vmn = (l - h.shift(1)).abs()
+    vi_p = vmp.rolling(period).sum() / tr.rolling(period).sum().replace(0, np.nan)
+    vi_n = vmn.rolling(period).sum() / tr.rolling(period).sum().replace(0, np.nan)
+    return {"vi_p": vi_p, "vi_n": vi_n}
+def _d2s7_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["vi_p"].iloc[i-1], p["vi_p"].iloc[i], p["vi_n"].iloc[i-1], p["vi_n"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["vi_p"].iloc[i-1], p["vi_p"].iloc[i], p["vi_n"].iloc[i-1], p["vi_n"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e7_vortex", "Vortex Indicator", _d2s7_pre, _d2s7_sig, None, group="discover2")
+
+
+# 8. TRIX
+def _d2s8_pre(df, period=15):
+    e1 = ema(df["close"], period); e2 = ema(e1, period); e3 = ema(e2, period)
+    return {"trix": 100 * (e3 - e3.shift(1)) / e3.shift(1).replace(0, np.nan)}
+def _d2s8_sig(p, i):
+    if i < 1: return None
+    pp = p["trix"].iloc[i-1]; pc = p["trix"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0 and pc > 0: return "LONG"
+    if pp >= 0 and pc < 0: return "SHORT"
+    return None
+_register("e8_trix", "TRIX", _d2s8_pre, _d2s8_sig, None, group="discover2")
+
+
+# 9. Know Sure Thing (KST)
+def _d2s9_pre(df):
+    r1 = _roc(df["close"], 10).rolling(10).mean()
+    r2 = _roc(df["close"], 15).rolling(10).mean()
+    r3 = _roc(df["close"], 20).rolling(10).mean()
+    r4 = _roc(df["close"], 30).rolling(15).mean()
+    kst = r1 + 2 * r2 + 3 * r3 + 4 * r4
+    return {"kst": kst, "kst_sig": kst.rolling(9).mean()}
+def _d2s9_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["kst"].iloc[i-1], p["kst"].iloc[i], p["kst_sig"].iloc[i-1], p["kst_sig"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["kst"].iloc[i-1], p["kst"].iloc[i], p["kst_sig"].iloc[i-1], p["kst_sig"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e9_kst", "Know Sure Thing", _d2s9_pre, _d2s9_sig, None, group="discover2")
+
+
+# 10. Aroon
+def _d2s10_pre(df, period=25):
+    high = df["high"]; low = df["low"]
+    aroon_up = high.rolling(period + 1).apply(
+        lambda x: 100 * (period - (period - int(np.argmax(x)))) / period, raw=True
+    )
+    aroon_dn = low.rolling(period + 1).apply(
+        lambda x: 100 * (period - (period - int(np.argmin(x)))) / period, raw=True
+    )
+    return {"aup": aroon_up, "adn": aroon_dn}
+def _d2s10_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["aup"].iloc[i-1], p["aup"].iloc[i], p["adn"].iloc[i-1], p["adn"].iloc[i], "up"):
+        if p["aup"].iloc[i] > 70: return "LONG"
+    if _crosses(p["aup"].iloc[i-1], p["aup"].iloc[i], p["adn"].iloc[i-1], p["adn"].iloc[i], "down"):
+        if p["adn"].iloc[i] > 70: return "SHORT"
+    return None
+_register("e10_aroon", "Aroon Crossover", _d2s10_pre, _d2s10_sig, None, group="discover2")
+
+
+# 11. Chande Momentum Oscillator
+def _d2s11_pre(df, period=14):
+    diff = df["close"].diff()
+    up = diff.clip(lower=0).rolling(period).sum()
+    dn = (-diff.clip(upper=0)).rolling(period).sum()
+    cmo = 100 * (up - dn) / (up + dn).replace(0, np.nan)
+    return {"cmo": cmo}
+def _d2s11_sig(p, i):
+    if i < 1: return None
+    pp = p["cmo"].iloc[i-1]; pc = p["cmo"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= -50 and pc > -50: return "LONG"
+    if pp >= 50 and pc < 50: return "SHORT"
+    return None
+_register("e11_cmo", "Chande Momentum", _d2s11_pre, _d2s11_sig, None, group="discover2")
+
+
+# 12. Price Oscillator (PPO-like)
+def _d2s12_pre(df):
+    e10 = ema(df["close"], 10); e30 = ema(df["close"], 30)
+    return {"po": 100 * (e10 - e30) / e30.replace(0, np.nan)}
+def _d2s12_sig(p, i):
+    if i < 1: return None
+    pp = p["po"].iloc[i-1]; pc = p["po"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0 and pc > 0: return "LONG"
+    if pp >= 0 and pc < 0: return "SHORT"
+    return None
+_register("e12_price_osc", "Price Oscillator", _d2s12_pre, _d2s12_sig, None, group="discover2")
+
+
+# 13. Inertia (Linear regression of RVI)
+def _d2s13_pre(df, period=14):
+    co = (df["close"] - df["open"]).rolling(4).mean()
+    hl = (df["high"] - df["low"]).rolling(4).mean()
+    rvi = co / hl.replace(0, np.nan)
+    inertia = rvi.rolling(period).apply(
+        lambda x: float(np.polyfit(np.arange(len(x)), x, 1)[0] * (len(x) - 1) + np.mean(x)) if not np.any(np.isnan(x)) else float("nan"),
+        raw=True,
+    )
+    # Scale 0-100 by passing through sigmoid-like normalize to 50 +/- 50*tanh
+    inertia_scaled = 50 + 50 * np.tanh(inertia)
+    return {"inertia": pd.Series(inertia_scaled, index=df.index)}
+def _d2s13_sig(p, i):
+    if i < 1: return None
+    pp = p["inertia"].iloc[i-1]; pc = p["inertia"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 50 and pc > 50: return "LONG"
+    if pp >= 50 and pc < 50: return "SHORT"
+    return None
+_register("e13_inertia", "Inertia", _d2s13_pre, _d2s13_sig, None, group="discover2")
+
+
+# 14. Relative Vigor Index
+def _d2s14_pre(df):
+    co = df["close"] - df["open"]
+    hl = (df["high"] - df["low"]).replace(0, np.nan)
+    rvi_n = (co + 2 * co.shift(1) + 2 * co.shift(2) + co.shift(3)) / 6
+    rvi_d = (hl + 2 * hl.shift(1) + 2 * hl.shift(2) + hl.shift(3)) / 6
+    rvi = rvi_n / rvi_d
+    sig = (rvi + 2 * rvi.shift(1) + 2 * rvi.shift(2) + rvi.shift(3)) / 6
+    return {"rvi": rvi, "sig": sig}
+def _d2s14_sig(p, i):
+    if i < 1: return None
+    rp = p["rvi"].iloc[i-1]; rc = p["rvi"].iloc[i]
+    sp = p["sig"].iloc[i-1]; sc = p["sig"].iloc[i]
+    if any(pd.isna(x) for x in (rp, rc, sp, sc)): return None
+    if rp <= sp and rc > sc and rc < 0: return "LONG"
+    if rp >= sp and rc < sc and rc > 0: return "SHORT"
+    return None
+_register("e14_rvi", "Relative Vigor Index", _d2s14_pre, _d2s14_sig, None, group="discover2")
+
+
+# 15. Psychological Line
+def _d2s15_pre(df, period=12):
+    rising = (df["close"] > df["close"].shift(1)).astype(float)
+    return {"psy": 100 * rising.rolling(period).mean()}
+def _d2s15_sig(p, i):
+    if i < 1: return None
+    pp = p["psy"].iloc[i-1]; pc = p["psy"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pc < 30 and pc > pp: return "LONG"
+    if pc > 70 and pc < pp: return "SHORT"
+    return None
+_register("e15_psy_line", "Psychological Line", _d2s15_pre, _d2s15_sig, None, group="discover2")
+
+
+# 16. Vertical Horizontal Filter
+def _d2s16_pre(df, period=28):
+    high_n = df["close"].rolling(period).max()
+    low_n = df["close"].rolling(period).min()
+    rng = high_n - low_n
+    sum_diff = df["close"].diff().abs().rolling(period).sum()
+    vhf = rng / sum_diff.replace(0, np.nan)
+    return {"vhf": vhf, "rsi": rsi(df["close"], 14)}
+def _d2s16_sig(p, i):
+    v = p["vhf"].iloc[i]; r = p["rsi"].iloc[i]
+    if pd.isna(v) or pd.isna(r): return None
+    if v < 0.35 and r < 40: return "LONG"
+    if v < 0.35 and r > 60: return "SHORT"
+    return None
+_register("e16_vhf", "VHF + RSI", _d2s16_pre, _d2s16_sig, None, group="discover2")
+
+
+# 17. Price Channel Breakout
+def _d2s17_pre(df, period=20):
+    return {
+        "hh": df["high"].rolling(period).max().shift(1),
+        "ll": df["low"].rolling(period).min().shift(1),
+        "close": df["close"],
+    }
+def _d2s17_sig(p, i):
+    c = p["close"].iloc[i]; hh = p["hh"].iloc[i]; ll = p["ll"].iloc[i]
+    if any(pd.isna(x) for x in (c, hh, ll)): return None
+    if c > hh: return "LONG"
+    if c < ll: return "SHORT"
+    return None
+_register("e17_price_channel", "Price Channel Breakout", _d2s17_pre, _d2s17_sig, None, group="discover2")
+
+
+# 18. Donchian Channel midline reversion
+def _d2s18_pre(df, period=20):
+    hh = df["high"].rolling(period).max()
+    ll = df["low"].rolling(period).min()
+    mid = (hh + ll) / 2
+    return {"hh": hh, "ll": ll, "mid": mid, "close": df["close"], "low": df["low"], "high": df["high"]}
+def _d2s18_sig(p, i):
+    c = p["close"].iloc[i]; lo = p["low"].iloc[i]; hi = p["high"].iloc[i]
+    ll = p["ll"].iloc[i]; hh = p["hh"].iloc[i]; m = p["mid"].iloc[i]
+    if any(pd.isna(x) for x in (c, lo, hi, ll, hh, m)): return None
+    if lo <= ll and c > m: return "LONG"
+    if hi >= hh and c < m: return "SHORT"
+    return None
+def _d2s18_exit(p, i, d):
+    c = p["close"].iloc[i]; m = p["mid"].iloc[i]
+    if pd.isna(c) or pd.isna(m): return False
+    if d == "LONG" and c >= p["hh"].iloc[i]: return "Reached upper Donchian"
+    if d == "SHORT" and c <= p["ll"].iloc[i]: return "Reached lower Donchian"
+    return False
+_register("e18_donchian_mid", "Donchian Mid Reversion", _d2s18_pre, _d2s18_sig, _d2s18_exit, group="discover2")
+
+
+# 19. Linear Regression Slope
+def _d2s19_pre(df, period=20):
+    def _slope(x):
+        if np.any(np.isnan(x)): return float("nan")
+        return float(np.polyfit(np.arange(len(x)), x, 1)[0])
+    return {"slope": df["close"].rolling(period).apply(_slope, raw=True)}
+def _d2s19_sig(p, i):
+    if i < 1: return None
+    pp = p["slope"].iloc[i-1]; pc = p["slope"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0 and pc > 0: return "LONG"
+    if pp >= 0 and pc < 0: return "SHORT"
+    return None
+_register("e19_lr_slope", "Linear Regression Slope", _d2s19_pre, _d2s19_sig, None, group="discover2")
+
+
+# 20. R-squared filter with RSI
+def _d2s20_pre(df, period=14):
+    def _r2(x):
+        if np.any(np.isnan(x)): return float("nan")
+        n = len(x); xs = np.arange(n)
+        ss_tot = float(np.var(x) * n)
+        if ss_tot == 0: return 1.0
+        slope, intercept = np.polyfit(xs, x, 1)
+        pred = slope * xs + intercept
+        ss_res = float(np.sum((x - pred) ** 2))
+        return float(1 - ss_res / ss_tot)
+    return {"r2": df["close"].rolling(period).apply(_r2, raw=True), "rsi": rsi(df["close"], 14)}
+def _d2s20_sig(p, i):
+    r2 = p["r2"].iloc[i]; r = p["rsi"].iloc[i]
+    if pd.isna(r2) or pd.isna(r): return None
+    if r2 < 0.35 and r < 35: return "LONG"
+    if r2 < 0.35 and r > 65: return "SHORT"
+    return None
+_register("e20_r2_rsi", "R-squared + RSI", _d2s20_pre, _d2s20_sig, None, group="discover2")
+
+
+# 21. Adaptive RSI (Kaufman efficiency ratio adapts period)
+def _d2s21_pre(df, base=14):
+    diff = df["close"].diff().abs()
+    direction = (df["close"] - df["close"].shift(10)).abs()
+    volatility = diff.rolling(10).sum().replace(0, np.nan)
+    er = (direction / volatility).clip(0, 1).fillna(0.5)
+    # adaptive period 5..25
+    adaptive_period = (5 + (1 - er) * 20).round().astype(int)
+    # Approximate adaptive RSI by interpolating between rsi(5) and rsi(25)
+    rsi5 = rsi(df["close"], 5)
+    rsi25 = rsi(df["close"], 25)
+    blend = (adaptive_period - 5) / 20
+    arsi = rsi5 * (1 - blend) + rsi25 * blend
+    return {"arsi": arsi}
+def _d2s21_sig(p, i):
+    if i < 1: return None
+    pp = p["arsi"].iloc[i-1]; pc = p["arsi"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 30 and pc > 30: return "LONG"
+    if pp >= 70 and pc < 70: return "SHORT"
+    return None
+_register("e21_adaptive_rsi", "Adaptive RSI", _d2s21_pre, _d2s21_sig, None, group="discover2")
+
+
+# 22. Chaikin Money Flow
+def _d2s22_pre(df, period=20):
+    mfm = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / (df["high"] - df["low"]).replace(0, np.nan)
+    mfv = mfm * df["volume"]
+    cmf = mfv.rolling(period).sum() / df["volume"].rolling(period).sum().replace(0, np.nan)
+    return {"cmf": cmf}
+def _d2s22_sig(p, i):
+    if i < 1: return None
+    pp = p["cmf"].iloc[i-1]; pc = p["cmf"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0.05 and pc > 0.05: return "LONG"
+    if pp >= -0.05 and pc < -0.05: return "SHORT"
+    return None
+_register("e22_cmf", "Chaikin Money Flow", _d2s22_pre, _d2s22_sig, None, group="discover2")
+
+
+# 23. Force Index
+def _d2s23_pre(df):
+    fi = (df["close"] - df["close"].shift(1)) * df["volume"]
+    return {"fi": ema(fi, 13)}
+def _d2s23_sig(p, i):
+    if i < 1: return None
+    pp = p["fi"].iloc[i-1]; pc = p["fi"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0 and pc > 0: return "LONG"
+    if pp >= 0 and pc < 0: return "SHORT"
+    return None
+_register("e23_force_index", "Force Index", _d2s23_pre, _d2s23_sig, None, group="discover2")
+
+
+# 24. Ease of Movement
+def _d2s24_pre(df, period=14):
+    mid = (df["high"] + df["low"]) / 2
+    box = df["volume"] / (df["high"] - df["low"]).replace(0, np.nan)
+    raw = (mid - mid.shift(1)) / box.replace(0, np.nan)
+    return {"emv": raw.rolling(period).mean()}
+def _d2s24_sig(p, i):
+    if i < 1: return None
+    pp = p["emv"].iloc[i-1]; pc = p["emv"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 0 and pc > 0: return "LONG"
+    if pp >= 0 and pc < 0: return "SHORT"
+    return None
+_register("e24_emv", "Ease of Movement", _d2s24_pre, _d2s24_sig, None, group="discover2")
+
+
+# 25. Negative Volume Index
+def _d2s25_pre(df, ema_period=255):
+    n = len(df)
+    nvi = np.zeros(n)
+    nvi[0] = 1000
+    closes = df["close"].values
+    vols = df["volume"].values
+    for i in range(1, n):
+        if vols[i] < vols[i-1]:
+            pct = (closes[i] - closes[i-1]) / closes[i-1] if closes[i-1] != 0 else 0
+            nvi[i] = nvi[i-1] * (1 + pct)
+        else:
+            nvi[i] = nvi[i-1]
+    nvi_s = pd.Series(nvi, index=df.index)
+    return {"nvi": nvi_s, "nvi_ema": ema(nvi_s, ema_period)}
+def _d2s25_sig(p, i):
+    if i < 1: return None
+    pp = p["nvi"].iloc[i-1]; pc = p["nvi"].iloc[i]
+    ep = p["nvi_ema"].iloc[i-1]; ec = p["nvi_ema"].iloc[i]
+    if any(pd.isna(x) for x in (pp, pc, ep, ec)): return None
+    if pp <= ep and pc > ec: return "LONG"
+    if pp >= ep and pc < ec: return "SHORT"
+    return None
+_register("e25_nvi", "Negative Volume Index", _d2s25_pre, _d2s25_sig, None, group="discover2")
+
+
+def handle_discover2_command(reply_to_message_id: int | None = None) -> None:
+    global discover_running
+    with discover_lock:
+        if discover_running:
+            send_telegram("Discovery already in progress.",
+                          reply_to_message_id=reply_to_message_id)
+            return
+        discover_running = True
+    n_strats = len([s for s in STRATEGIES if s.group == "discover2"])
+    send_telegram(
+        f"<b>Strategy discovery 2 started</b>\n"
+        f"Testing {n_strats} unconventional strategies on 6mo of 1H data across 20 pairs. "
+        "Pass = opt WR >= 60% AND val WR >= 55% AND >= 100 trades on opt window. "
+        "This will take quite a while.",
+        reply_to_message_id=reply_to_message_id,
+    )
+    threading.Thread(
+        target=_run_discover, args=(reply_to_message_id, "discover2"), daemon=True
+    ).start()
+
+
 # ===== Strategy persistence and discovery loop =====
 
 STRATEGY_PATH = os.environ.get(
@@ -1881,6 +2384,8 @@ def telegram_poll_loop() -> None:
                     handle_optimize_command(msg.get("message_id"))
                 elif cmd == "/discover":
                     handle_discover_command(msg.get("message_id"))
+                elif cmd == "/discover2":
+                    handle_discover2_command(msg.get("message_id"))
         except Exception as e:
             log.warning("Telegram poll error: %s", e)
             time.sleep(5)
