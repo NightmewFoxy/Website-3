@@ -111,9 +111,12 @@ def send_telegram(text: str, reply_to_message_id: int | None = None) -> None:
         log.error("Telegram request error: %s", e)
 
 
-def fetch_klines(symbol: str, interval: str = TIMEFRAME, limit: int = KLINE_LIMIT) -> pd.DataFrame:
+def fetch_klines(symbol: str, interval: str = TIMEFRAME, limit: int = KLINE_LIMIT,
+                 end_time: int | None = None) -> pd.DataFrame:
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if end_time is not None:
+        params["endTime"] = end_time
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     raw = r.json()
@@ -126,6 +129,28 @@ def fetch_klines(symbol: str, interval: str = TIMEFRAME, limit: int = KLINE_LIMI
         df[col] = df[col].astype(float)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    return df
+
+
+def fetch_klines_paginated(symbol: str, interval: str, target: int) -> pd.DataFrame:
+    chunks: list[pd.DataFrame] = []
+    end_ms = int(time.time() * 1000)
+    fetched = 0
+    while fetched < target:
+        chunk = fetch_klines(symbol, interval=interval, limit=1000, end_time=end_ms)
+        if chunk.empty:
+            break
+        chunks.append(chunk)
+        fetched += len(chunk)
+        oldest_open_ms = int(chunk["open_time"].iloc[0].timestamp() * 1000)
+        end_ms = oldest_open_ms - 1
+        if len(chunk) < 1000:
+            break
+        time.sleep(0.1)
+    if not chunks:
+        return pd.DataFrame()
+    df = pd.concat(chunks, ignore_index=True)
+    df = df.drop_duplicates(subset="open_time").sort_values("open_time").reset_index(drop=True)
     return df
 
 
@@ -410,6 +435,210 @@ def handle_check_command(reply_to_message_id: int | None = None) -> None:
     log.info("/check reply sent (%d pairs)", len(rankings))
 
 
+def backtest_pair(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> list[dict]:
+    close = df_1h["close"]
+    high_arr = df_1h["high"]
+    low_arr = df_1h["low"]
+    volume = df_1h["volume"]
+
+    ema100_1h = ema(close, 100)
+    rsi14 = rsi(close, 14)
+    macd_line, sig_line, hist = macd(close)
+    obv_line = obv(close, volume)
+    obv_ema_v = ema(obv_line, 20)
+    atr14 = atr(high_arr, low_arr, close, 14)
+    vol_sma20 = volume.rolling(window=20).mean()
+
+    ema100_4h_full = ema(df_4h["close"], 100)
+    ema100_4h_indexed = pd.Series(ema100_4h_full.values, index=df_4h["close_time"])
+    ema100_4h_aligned = ema100_4h_indexed.reindex(df_1h["close_time"], method="ffill").values
+
+    n = len(df_1h)
+    trades: list[dict] = []
+    open_pos: dict | None = None
+
+    for i in range(100, n):
+        c = float(close.iloc[i])
+        h = float(high_arr.iloc[i])
+        l = float(low_arr.iloc[i])
+
+        if open_pos is not None:
+            d = open_pos["direction"]
+            entry = open_pos["entry"]
+            tp = open_pos["tp"]
+            sl = open_pos["sl"]
+            risk = open_pos["risk"]
+
+            if d == "LONG":
+                tp_hit = h >= tp
+                sl_hit = l <= sl
+            else:
+                tp_hit = l <= tp
+                sl_hit = h >= sl
+
+            if sl_hit:
+                trades.append({"direction": d, "entry": entry, "exit": sl, "rr": -1.0, "result": "loss"})
+                open_pos = None
+                continue
+            if tp_hit:
+                trades.append({"direction": d, "entry": entry, "exit": tp, "rr": 2.0, "result": "win"})
+                open_pos = None
+                continue
+
+            macd_cur = float(macd_line.iloc[i]); macd_pr = float(macd_line.iloc[i - 1])
+            sig_cur = float(sig_line.iloc[i]); sig_pr = float(sig_line.iloc[i - 1])
+            cross_down = macd_pr >= sig_pr and macd_cur < sig_cur
+            cross_up = macd_pr <= sig_pr and macd_cur > sig_cur
+            rsi_cur = float(rsi14.iloc[i])
+            obv_cur = float(obv_line.iloc[i])
+            obv_ema_cur = float(obv_ema_v.iloc[i])
+
+            if d == "LONG":
+                cnt = sum([cross_down, rsi_cur > 70, obv_cur < obv_ema_cur])
+                if cnt >= 2:
+                    rr = (c - entry) / risk if risk > 0 else 0.0
+                    trades.append({"direction": d, "entry": entry, "exit": c, "rr": rr,
+                                   "result": "win" if rr > 0 else "loss"})
+                    open_pos = None
+            else:
+                cnt = sum([cross_up, rsi_cur < 30, obv_cur > obv_ema_cur])
+                if cnt >= 2:
+                    rr = (entry - c) / risk if risk > 0 else 0.0
+                    trades.append({"direction": d, "entry": entry, "exit": c, "rr": rr,
+                                   "result": "win" if rr > 0 else "loss"})
+                    open_pos = None
+            continue
+
+        ema100_now = float(ema100_1h.iloc[i])
+        ema100_4h_now = ema100_4h_aligned[i]
+        atr_cur = float(atr14.iloc[i])
+        vol_cur = float(volume.iloc[i])
+        vol_sma_cur = float(vol_sma20.iloc[i]) if pd.notna(vol_sma20.iloc[i]) else float("nan")
+
+        if pd.isna(ema100_4h_now) or pd.isna(atr_cur) or pd.isna(vol_sma_cur):
+            continue
+
+        macd_cur = float(macd_line.iloc[i]); macd_pr = float(macd_line.iloc[i - 1])
+        sig_cur = float(sig_line.iloc[i]); sig_pr = float(sig_line.iloc[i - 1])
+        hist_cur = float(hist.iloc[i]); hist_pr = float(hist.iloc[i - 1])
+        rsi_cur = float(rsi14.iloc[i]); rsi_pr = float(rsi14.iloc[i - 1])
+        obv_cur = float(obv_line.iloc[i]); obv_ema_cur = float(obv_ema_v.iloc[i])
+
+        cross_up = macd_pr <= sig_pr and macd_cur > sig_cur
+        cross_down = macd_pr >= sig_pr and macd_cur < sig_cur
+        hist_growing_up = hist_cur > hist_pr
+        hist_growing_down = hist_cur < hist_pr
+        rsi_in_range = 35 <= rsi_cur <= 65
+        rsi_long_bounce = rsi_pr < 30 and rsi_cur > rsi_pr
+        rsi_short_rollover = rsi_pr > 70 and rsi_cur < rsi_pr
+        rsi_long_ok = rsi_in_range or rsi_long_bounce
+        rsi_short_ok = rsi_in_range or rsi_short_rollover
+        obv_bull = obv_cur > obv_ema_cur
+        obv_bear = obv_cur < obv_ema_cur
+        volume_ok = vol_cur >= 1.2 * vol_sma_cur
+        trend_up = c > float(ema100_4h_now)
+        trend_down = c < float(ema100_4h_now)
+
+        if (c > ema100_now and trend_up and cross_up and hist_growing_up
+                and rsi_long_ok and obv_bull and volume_ok):
+            risk = 1.5 * atr_cur
+            open_pos = {
+                "direction": "LONG", "entry": c,
+                "tp": c + 3 * atr_cur, "sl": c - 1.5 * atr_cur, "risk": risk,
+            }
+        elif (c < ema100_now and trend_down and cross_down and hist_growing_down
+                and rsi_short_ok and obv_bear and volume_ok):
+            risk = 1.5 * atr_cur
+            open_pos = {
+                "direction": "SHORT", "entry": c,
+                "tp": c - 3 * atr_cur, "sl": c + 1.5 * atr_cur, "risk": risk,
+            }
+
+    return trades
+
+
+def handle_backtest_command(reply_to_message_id: int | None = None) -> None:
+    log.info("Processing /backtest command")
+    send_telegram(
+        "<b>Backtest started</b>\n"
+        "Fetching ~3 months of 1H + 4H data for 20 pairs and simulating the strategy. "
+        "Results will arrive in a few minutes.",
+        reply_to_message_id=reply_to_message_id,
+    )
+    threading.Thread(
+        target=_run_backtest, args=(reply_to_message_id,), daemon=True
+    ).start()
+
+
+def _run_backtest(reply_to_message_id: int | None) -> None:
+    try:
+        results: list[dict] = []
+        date_min = None
+        date_max = None
+        for symbol in PAIRS:
+            try:
+                df_1h = fetch_klines_paginated(symbol, "1h", target=2160)
+                df_4h = fetch_klines_paginated(symbol, "4h", target=540)
+                if len(df_1h) < 200 or len(df_4h) < 50:
+                    log.warning("backtest %s: insufficient data (1h=%d, 4h=%d)",
+                                symbol, len(df_1h), len(df_4h))
+                    continue
+                first_ct = df_1h["close_time"].iloc[0]
+                last_ct = df_1h["close_time"].iloc[-1]
+                date_min = first_ct if date_min is None or first_ct < date_min else date_min
+                date_max = last_ct if date_max is None or last_ct > date_max else date_max
+
+                trades = backtest_pair(df_1h, df_4h)
+                wins = sum(1 for t in trades if t["result"] == "win")
+                losses = sum(1 for t in trades if t["result"] == "loss")
+                total = len(trades)
+                wr = (100.0 * wins / total) if total else 0.0
+                avg_rr = (sum(t["rr"] for t in trades) / total) if total else 0.0
+                results.append({
+                    "symbol": symbol, "total": total, "wins": wins,
+                    "losses": losses, "wr": wr, "avg_rr": avg_rr,
+                })
+                log.info("backtest %s: %d trades, %.1f%% WR, avg RR %+.2f",
+                         symbol, total, wr, avg_rr)
+            except Exception as e:
+                log.exception("backtest %s failed: %s", symbol, e)
+
+        results.sort(key=lambda x: (x["wr"], x["total"]), reverse=True)
+
+        lines = ["<b>Backtest results</b>"]
+        if date_min is not None and date_max is not None:
+            lines.append(
+                f"Range: {date_min.strftime('%Y-%m-%d')} -> {date_max.strftime('%Y-%m-%d')}"
+            )
+        lines.append("")
+        lines.append("<pre>")
+        lines.append(f"{'Pair':<10}{'T':>4}{'W':>4}{'L':>4}{'WR%':>7}{'avgRR':>8}")
+        for r in results:
+            lines.append(
+                f"{r['symbol']:<10}{r['total']:>4}{r['wins']:>4}{r['losses']:>4}"
+                f"{r['wr']:>6.1f}%{r['avg_rr']:>+8.2f}"
+            )
+        lines.append("</pre>")
+
+        total_t = sum(r["total"] for r in results)
+        total_w = sum(r["wins"] for r in results)
+        overall_wr = (100.0 * total_w / total_t) if total_t else 0.0
+        lines.append(
+            f"<b>Overall:</b> {total_w}/{total_t} wins = {overall_wr:.1f}% across all pairs"
+        )
+        lines.append("")
+        lines.append("<i>Past performance does not guarantee future results.</i>")
+
+        send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
+        log.info("Backtest complete: %d total trades, %.1f%% overall WR", total_t, overall_wr)
+    except Exception as e:
+        log.exception("backtest failed: %s", e)
+        send_telegram(
+            f"<b>Backtest failed</b>\n{e}",
+            reply_to_message_id=reply_to_message_id,
+        )
+
+
 def telegram_poll_loop() -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram polling disabled (missing credentials)")
@@ -451,6 +680,8 @@ def telegram_poll_loop() -> None:
                 cmd = parts[0].split("@")[0]
                 if cmd == "/check":
                     handle_check_command(msg.get("message_id"))
+                elif cmd == "/backtest":
+                    handle_backtest_command(msg.get("message_id"))
         except Exception as e:
             log.warning("Telegram poll error: %s", e)
             time.sleep(5)
