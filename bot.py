@@ -258,6 +258,14 @@ def compute_ema_slope(series: pd.Series, period: int = 50, lookback: int = 3) ->
     return e - e.shift(lookback)
 
 
+def compute_stoch_rsi(close: pd.Series, rsi_period: int = 14, stoch_period: int = 14) -> pd.Series:
+    rsi_series = rsi(close, rsi_period)
+    rsi_min = rsi_series.rolling(window=stoch_period).min()
+    rsi_max = rsi_series.rolling(window=stoch_period).max()
+    rng = (rsi_max - rsi_min).replace(0, np.nan)
+    return 100 * (rsi_series - rsi_min) / rng
+
+
 def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat([
@@ -315,11 +323,10 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     obv_line = obv(close, volume)
     obv_ema = ema(obv_line, 20)
     atr14 = atr(high, low, close, 14)
+    stoch_rsi_series = compute_stoch_rsi(close, 14, 14)
 
     price = float(close.iloc[-1])
     rsi_now = rsi14.iloc[-1]
-    rsi_prev1 = rsi14.iloc[-2] if len(rsi14) >= 2 else float("nan")
-    rsi_prev2 = rsi14.iloc[-3] if len(rsi14) >= 3 else float("nan")
     bb_upper_now = bb_upper.iloc[-1]
     bb_lower_now = bb_lower.iloc[-1]
     bb_middle_now = bb_middle.iloc[-1]
@@ -327,6 +334,8 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     obv_now = obv_line.iloc[-1]
     obv_ema_now = obv_ema.iloc[-1]
     atr_now = atr14.iloc[-1]
+    stoch_now = stoch_rsi_series.iloc[-1]
+    stoch_prev = stoch_rsi_series.iloc[-2] if len(stoch_rsi_series) >= 2 else float("nan")
 
     recent_rsi_low = any(
         pd.notna(rsi14.iloc[-i]) and rsi14.iloc[-i] < 30 for i in (1, 2, 3) if len(rsi14) >= i
@@ -336,11 +345,11 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     )
     recent_bb_long_touch = any(
         pd.notna(low.iloc[-i]) and pd.notna(bb_lower.iloc[-i]) and low.iloc[-i] <= bb_lower.iloc[-i]
-        for i in (1, 2) if len(low) >= i
+        for i in (1, 2, 3) if len(low) >= i
     )
     recent_bb_short_touch = any(
         pd.notna(high.iloc[-i]) and pd.notna(bb_upper.iloc[-i]) and high.iloc[-i] >= bb_upper.iloc[-i]
-        for i in (1, 2) if len(high) >= i
+        for i in (1, 2, 3) if len(high) >= i
     )
 
     near_lower = (
@@ -351,17 +360,26 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
         pd.notna(bb_upper_now)
         and abs(price - float(bb_upper_now)) <= 0.002 * price
     )
-    slope_flat = pd.notna(slope_now) and abs(float(slope_now)) < 0.003 * price
+    slope_flat = pd.notna(slope_now) and abs(float(slope_now)) < 0.0015 * price
     atr_ok = pd.notna(atr_now) and float(atr_now) >= 0.003 * price
+
+    stoch_long = (
+        pd.notna(stoch_now) and pd.notna(stoch_prev)
+        and stoch_now < 20 and stoch_now > stoch_prev
+    )
+    stoch_short = (
+        pd.notna(stoch_now) and pd.notna(stoch_prev)
+        and stoch_now > 80 and stoch_now < stoch_prev
+    )
 
     c1_long = bool((pd.notna(rsi_now) and rsi_now < 35) or recent_rsi_low)
     c2_long = bool(near_lower or recent_bb_long_touch)
-    c3_long = bool(obv_now > obv_ema_now)
+    c3_long = bool(stoch_long)
     c4_long = bool(slope_flat)
 
     c1_short = bool((pd.notna(rsi_now) and rsi_now > 65) or recent_rsi_high)
     c2_short = bool(near_upper or recent_bb_short_touch)
-    c3_short = bool(obv_now < obv_ema_now)
+    c3_short = bool(stoch_short)
     c4_short = bool(slope_flat)
 
     long_count = sum([c1_long, c2_long, c3_long, c4_long])
@@ -575,6 +593,7 @@ def _precompute_bt(df_1h: pd.DataFrame, df_4h: pd.DataFrame | None = None,
         "obv_ema": ema(obv_line, 20),
         "atr14": atr(high_arr, low_arr, close, 14),
         "vol_sma20": volume.rolling(window=20).mean(),
+        "stoch_rsi": compute_stoch_rsi(close, 14, 14),
     }
 
 
@@ -594,6 +613,7 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
     obv_ema_v = precomp["obv_ema"]
     atr14 = precomp["atr14"]
     vol_sma20 = precomp["vol_sma20"]
+    stoch_rsi_series = precomp["stoch_rsi"]
 
     sl_mult = sim_params["sl_mult"]
     tp_mult = sim_params["tp_mult"]
@@ -706,31 +726,35 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
             i - k >= 0
             and pd.notna(low_arr.iloc[i - k]) and pd.notna(bb_lower.iloc[i - k])
             and low_arr.iloc[i - k] <= bb_lower.iloc[i - k]
-            for k in (0, 1)
+            for k in (0, 1, 2)
         )
         bb_short_touch_recent = any(
             i - k >= 0
             and pd.notna(high_arr.iloc[i - k]) and pd.notna(bb_upper.iloc[i - k])
             and high_arr.iloc[i - k] >= bb_upper.iloc[i - k]
-            for k in (0, 1)
+            for k in (0, 1, 2)
         )
         near_lower = abs(c - bb_lower_cur) <= 0.002 * c
         near_upper = abs(c - bb_upper_cur) <= 0.002 * c
 
-        obv_cur = float(obv_line.iloc[i])
-        obv_ema_cur = float(obv_ema_v.iloc[i])
+        stoch_now = stoch_rsi_series.iloc[i]
+        stoch_prev = stoch_rsi_series.iloc[i - 1] if i >= 1 else float("nan")
+        if pd.isna(stoch_now) or pd.isna(stoch_prev):
+            continue
+        stoch_now = float(stoch_now)
+        stoch_prev = float(stoch_prev)
 
-        slope_flat = abs(slope) < 0.003 * c
+        slope_flat = abs(slope) < 0.0015 * c
         atr_ok = atr_cur >= 0.003 * c
 
         c1_long = (rsi_cur < 35) or rsi_recent_low
         c2_long = near_lower or bb_long_touch_recent
-        c3_long = obv_cur > obv_ema_cur
+        c3_long = stoch_now < 20 and stoch_now > stoch_prev
         c4_long = slope_flat
 
         c1_short = (rsi_cur > 65) or rsi_recent_high
         c2_short = near_upper or bb_short_touch_recent
-        c3_short = obv_cur < obv_ema_cur
+        c3_short = stoch_now > 80 and stoch_now < stoch_prev
         c4_short = slope_flat
 
         long_arr = [c1_long, c2_long, c3_long, c4_long]
@@ -761,9 +785,9 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
             if c4_long: debug["fired_c4"] += 1
             if log_entries:
                 log.info(
-                    "backtest %s LONG entry @ %.6g | rsi=%.2f bb_low=%.6g slope=%+.6g | "
+                    "backtest %s LONG entry @ %.6g | rsi=%.2f stochrsi=%.1f bb_low=%.6g slope=%+.6g | "
                     "c1=%s c2=%s c3=%s c4=%s",
-                    symbol, c, rsi_cur, bb_lower_cur, slope,
+                    symbol, c, rsi_cur, stoch_now, bb_lower_cur, slope,
                     c1_long, c2_long, c3_long, c4_long,
                 )
         elif short_fires:
@@ -779,9 +803,9 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
             if c4_short: debug["fired_c4"] += 1
             if log_entries:
                 log.info(
-                    "backtest %s SHORT entry @ %.6g | rsi=%.2f bb_up=%.6g slope=%+.6g | "
+                    "backtest %s SHORT entry @ %.6g | rsi=%.2f stochrsi=%.1f bb_up=%.6g slope=%+.6g | "
                     "c1=%s c2=%s c3=%s c4=%s",
-                    symbol, c, rsi_cur, bb_upper_cur, slope,
+                    symbol, c, rsi_cur, stoch_now, bb_upper_cur, slope,
                     c1_short, c2_short, c3_short, c4_short,
                 )
 
@@ -903,7 +927,7 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
             f"Per-condition true on evaluated candles: "
             f"c1 RSI extreme {agg_debug['eval_c1']:,} ({100*agg_debug['eval_c1']/evals:.1f}%), "
             f"c2 BB touch/near {agg_debug['eval_c2']:,} ({100*agg_debug['eval_c2']/evals:.1f}%), "
-            f"c3 OBV aligned {agg_debug['eval_c3']:,} ({100*agg_debug['eval_c3']/evals:.1f}%), "
+            f"c3 StochRSI extreme {agg_debug['eval_c3']:,} ({100*agg_debug['eval_c3']/evals:.1f}%), "
             f"c4 slope flat {agg_debug['eval_c4']:,} ({100*agg_debug['eval_c4']/evals:.1f}%)"
         )
         lines.append(
