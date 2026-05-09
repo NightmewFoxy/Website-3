@@ -3649,98 +3649,6 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame | None =
     return _simulate_with_precomp(symbol, precomp, sim_params, log_entries=True)
 
 
-def handle_backtest_command(reply_to_message_id: int | None = None) -> None:
-    log.info("Processing /backtest command")
-    strat = _resolve_active_strategy()
-    strat_name = strat.name if strat else "(no active strategy)"
-    send_telegram(
-        f"<b>{strat_name} backtest started (backtesting.py engine)</b>\n"
-        "Running BTCUSDT 6-month POC first. If Sharpe > 1.0 and Expectancy > 0, "
-        "will expand to all 20 pairs. Otherwise stops and reports POC stats.",
-        reply_to_message_id=reply_to_message_id,
-    )
-    threading.Thread(
-        target=_run_backtest, args=(reply_to_message_id,), daemon=True
-    ).start()
-
-
-def _klines_to_bt_df(df: pd.DataFrame) -> pd.DataFrame:
-    out = df[["close_time", "open", "high", "low", "close", "volume"]].copy()
-    out = out.rename(columns={
-        "open": "Open", "high": "High", "low": "Low",
-        "close": "Close", "volume": "Volume",
-    })
-    out = out.set_index("close_time")
-    out.index = pd.DatetimeIndex(out.index).tz_convert(None)
-    return out[["Open", "High", "Low", "Close", "Volume"]]
-
-
-def _build_active_strategy_class(strat: "_Strategy"):
-    """Wrap a registered _Strategy as a backtesting.py Strategy that delegates
-    to the strategy's precompute / entry_signal_at / exit_reasons_at."""
-    from backtesting import Strategy
-
-    captured_strat = strat
-    sl_mult_default = strat.sl_mult
-    tp_mult_default = strat.tp_mult
-
-    class ActiveStrategy(Strategy):
-        sl_mult = sl_mult_default
-        tp_mult = tp_mult_default
-
-        def init(self):
-            # Reconstruct a pandas DataFrame so the strategy's precompute
-            # function can run unchanged. Indicators are causal so computing
-            # on the full series introduces no look-ahead bias.
-            idx = self.data.index
-            df_full = pd.DataFrame({
-                "open": np.asarray(self.data.Open),
-                "high": np.asarray(self.data.High),
-                "low": np.asarray(self.data.Low),
-                "close": np.asarray(self.data.Close),
-                "volume": np.asarray(self.data.Volume),
-            }, index=idx)
-            df_full["close_time"] = idx
-            self._precomp = captured_strat.precompute(df_full)
-            self._strat = captured_strat
-
-        def next(self):
-            i = len(self.data.Close) - 1
-            if i < 50:
-                return
-
-            atr_val = float("nan")
-            if "atr" in self._precomp:
-                v = self._precomp["atr"].iloc[i]
-                if pd.notna(v):
-                    atr_val = float(v)
-            if np.isnan(atr_val) or atr_val <= 0:
-                return
-
-            if self.position:
-                d = "LONG" if self.position.is_long else "SHORT"
-                exits = self._strat.exit_reasons_at(self._precomp, i, d)
-                if exits:
-                    self.position.close()
-                return
-
-            sig = self._strat.entry_signal_at(self._precomp, i)
-            if sig is None:
-                return
-
-            price = float(self.data.Close[-1])
-            if sig == "LONG":
-                tp = price + self.tp_mult * atr_val
-                sl = price - self.sl_mult * atr_val
-                self.buy(sl=sl, tp=tp)
-            elif sig == "SHORT":
-                tp = price - self.tp_mult * atr_val
-                sl = price + self.sl_mult * atr_val
-                self.sell(sl=sl, tp=tp)
-
-    return ActiveStrategy
-
-
 def _resolve_active_strategy() -> "_Strategy | None":
     sid = active_strategy_id
     if sid and sid in STRATEGIES_BY_ID:
@@ -3748,49 +3656,19 @@ def _resolve_active_strategy() -> "_Strategy | None":
     return None
 
 
-def _run_pair_library_backtest(symbol: str) -> dict | None:
-    from backtesting import Backtest
-
+def handle_backtest_command(reply_to_message_id: int | None = None) -> None:
+    log.info("Processing /backtest command")
     strat = _resolve_active_strategy()
-    if strat is None:
-        log.warning("backtest %s: no active strategy", symbol)
-        return None
-
-    df = fetch_klines_paginated(symbol, "1h", target=4320)
-    if len(df) < 200:
-        log.warning("backtest %s: insufficient data (%d)", symbol, len(df))
-        return None
-
-    bt_df = _klines_to_bt_df(df)
-    StrategyCls = _build_active_strategy_class(strat)
-    bt = Backtest(
-        bt_df, StrategyCls,
-        cash=10000, commission=0.001, exclusive_orders=True,
+    strat_name = strat.name if strat else "(no active strategy)"
+    send_telegram(
+        f"<b>{strat_name} backtest started</b>\n"
+        f"Walk-forward simulation on 6 months of 1H data across {len(PAIRS)} pairs "
+        "using the same engine /discover uses. Results in a few minutes.",
+        reply_to_message_id=reply_to_message_id,
     )
-    stats = bt.run()
-
-    def _f(key, default=0.0):
-        v = stats.get(key, default)
-        try:
-            v = float(v)
-        except (TypeError, ValueError):
-            return default
-        if v != v:  # NaN
-            return default
-        return v
-
-    return {
-        "symbol": symbol,
-        "trades": int(_f("# Trades", 0)),
-        "wr": _f("Win Rate [%]"),
-        "sharpe": _f("Sharpe Ratio"),
-        "max_dd": _f("Max. Drawdown [%]"),
-        "expectancy": _f("Expectancy [%]"),
-        "ret": _f("Return [%]"),
-        "sqn": _f("SQN"),
-        "start": str(bt_df.index[0].date()),
-        "end": str(bt_df.index[-1].date()),
-    }
+    threading.Thread(
+        target=_run_backtest, args=(reply_to_message_id,), daemon=True
+    ).start()
 
 
 def _run_backtest(reply_to_message_id: int | None) -> None:
@@ -3804,105 +3682,97 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
             return
         strat_name = active.name
         strat_id = active.id
-        log.info("library backtest: starting BTCUSDT POC for %s (%s)", strat_name, strat_id)
-        btc = _run_pair_library_backtest("BTCUSDT")
-        if btc is None:
-            send_telegram(
-                f"{strat_name} backtest aborted: insufficient BTCUSDT data.",
-                reply_to_message_id=reply_to_message_id,
-            )
-            return
+        log.info("backtest: starting %s (%s) across %d pairs",
+                 strat_name, strat_id, len(PAIRS))
 
-        poc_msg = (
-            f"<b>{strat_name} backtest POC: BTCUSDT</b>\n"
-            f"<i>Strategy ID: {strat_id}</i>\n"
-            f"Range: {btc['start']} -> {btc['end']}\n"
-            f"Trades: {btc['trades']}\n"
-            f"Win Rate: {btc['wr']:.2f}%\n"
-            f"Sharpe Ratio: {btc['sharpe']:.2f}\n"
-            f"Max Drawdown: {btc['max_dd']:.2f}%\n"
-            f"Expectancy: {btc['expectancy']:+.3f}%\n"
-            f"Return: {btc['ret']:+.2f}%\n"
-            f"SQN: {btc['sqn']:.2f}"
-        )
-        send_telegram(poc_msg, reply_to_message_id=reply_to_message_id)
-        log.info(
-            "POC: trades=%d wr=%.2f sharpe=%.2f exp=%.3f maxdd=%.2f",
-            btc["trades"], btc["wr"], btc["sharpe"], btc["expectancy"], btc["max_dd"],
-        )
-
-        passes = btc["sharpe"] > 1.0 and btc["expectancy"] > 0
-        if not passes:
-            why = []
-            if btc["sharpe"] <= 1.0:
-                why.append(f"Sharpe {btc['sharpe']:.2f} <= 1.0")
-            if btc["expectancy"] <= 0:
-                why.append(f"Expectancy {btc['expectancy']:+.3f}% <= 0")
-            send_telegram(
-                "POC did not meet thresholds (" + "; ".join(why) + "). "
-                "Reporting stats as is, awaiting further instructions.",
-                reply_to_message_id=reply_to_message_id,
-            )
-            return
-
-        send_telegram(
-            "POC passed (Sharpe > 1.0 AND Expectancy > 0). "
-            "Expanding to all 20 pairs - this takes a few minutes.",
-            reply_to_message_id=reply_to_message_id,
-        )
-
-        all_results: list[dict] = [btc]
+        results: list[dict] = []
+        date_min = None
+        date_max = None
         for symbol in PAIRS:
-            if symbol == "BTCUSDT":
-                continue
             try:
-                r = _run_pair_library_backtest(symbol)
-                if r is None:
+                df = fetch_klines_paginated(symbol, "1h", target=4320)
+                if len(df) < 200:
+                    log.warning("backtest %s: insufficient data (%d)",
+                                symbol, len(df))
                     continue
-                all_results.append(r)
-                log.info(
-                    "backtest %s: trades=%d wr=%.2f sharpe=%.2f exp=%.3f",
-                    symbol, r["trades"], r["wr"], r["sharpe"], r["expectancy"],
-                )
+                first_ct = df["close_time"].iloc[0]
+                last_ct = df["close_time"].iloc[-1]
+                if date_min is None or first_ct < date_min:
+                    date_min = first_ct
+                if date_max is None or last_ct > date_max:
+                    date_max = last_ct
+
+                trades = backtest_strategy(active, df)
+                wins = sum(1 for t in trades if t["result"] == "win")
+                losses = sum(1 for t in trades if t["result"] == "loss")
+                total = len(trades)
+                wr = (100.0 * wins / total) if total else 0.0
+                avg_rr = (sum(t["rr"] for t in trades) / total) if total else 0.0
+                results.append({
+                    "symbol": symbol, "trades": total,
+                    "wins": wins, "losses": losses,
+                    "wr": wr, "avg_rr": avg_rr,
+                })
+                log.info("backtest %s: %d trades, %.1f%% WR, avg RR %+.2f",
+                         symbol, total, wr, avg_rr)
             except Exception as e:
                 log.exception("backtest %s failed: %s", symbol, e)
 
-        all_results.sort(key=lambda r: r["sharpe"], reverse=True)
-        total_trades = sum(r["trades"] for r in all_results)
-        wr_weighted = (
-            sum(r["wr"] * r["trades"] for r in all_results) / total_trades
+        if not results:
+            send_telegram(
+                f"<b>{strat_name} backtest finished: no pair data available.</b>",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        results.sort(key=lambda x: x["wr"], reverse=True)
+        total_trades = sum(r["trades"] for r in results)
+        total_wins = sum(r["wins"] for r in results)
+        total_losses = sum(r["losses"] for r in results)
+        overall_wr = (100.0 * total_wins / total_trades) if total_trades else 0.0
+        weighted_rr = (
+            sum(r["avg_rr"] * r["trades"] for r in results) / total_trades
             if total_trades else 0.0
         )
-        sharpe_avg = sum(r["sharpe"] for r in all_results) / len(all_results)
-        exp_avg = sum(r["expectancy"] for r in all_results) / len(all_results)
-        ret_total = sum(r["ret"] for r in all_results)
 
-        lines = [f"<b>{strat_name} backtest: 20-pair results</b>",
-                 f"<i>Strategy ID: {strat_id}</i>"]
+        lines = [
+            f"<b>{strat_name} backtest: {len(results)}-pair results</b>",
+            f"<i>Strategy ID: {strat_id}</i>",
+        ]
+        if date_min is not None and date_max is not None:
+            lines.append(
+                f"Range: {date_min.strftime('%Y-%m-%d')} -> "
+                f"{date_max.strftime('%Y-%m-%d')}"
+            )
+        lines.append("")
         lines.append("<pre>")
         lines.append(
-            f"{'Pair':<10}{'T':>4}{'WR%':>7}{'Shrp':>7}{'DD%':>7}{'Exp%':>8}{'Ret%':>8}"
+            f"{'Pair':<10}{'T':>5}{'W':>5}{'L':>5}{'WR%':>7}{'avgRR':>8}"
         )
-        for r in all_results:
+        for r in results:
             lines.append(
-                f"{r['symbol']:<10}{r['trades']:>4}"
-                f"{r['wr']:>6.1f}%{r['sharpe']:>7.2f}"
-                f"{r['max_dd']:>6.1f}%{r['expectancy']:>+7.2f}%{r['ret']:>+7.2f}%"
+                f"{r['symbol']:<10}{r['trades']:>5}{r['wins']:>5}{r['losses']:>5}"
+                f"{r['wr']:>6.1f}%{r['avg_rr']:>+8.2f}"
             )
         lines.append("</pre>")
         lines.append("")
-        lines.append(f"Total trades: {total_trades}")
-        lines.append(f"Weighted win rate: {wr_weighted:.2f}%")
-        lines.append(f"Average Sharpe: {sharpe_avg:.2f}")
-        lines.append(f"Average expectancy: {exp_avg:+.3f}%")
-        lines.append(f"Sum of returns: {ret_total:+.2f}%")
+        lines.append(
+            f"<b>Overall:</b> {total_wins}/{total_trades} wins = "
+            f"{overall_wr:.2f}% ({total_losses} losses), "
+            f"weighted avg RR {weighted_rr:+.2f}"
+        )
         lines.append("")
         lines.append("<i>Past performance does not guarantee future results.</i>")
         send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
+        log.info(
+            "backtest %s done: %d trades across %d pairs, %.2f%% WR, "
+            "weighted avg RR %+.2f",
+            strat_name, total_trades, len(results), overall_wr, weighted_rr,
+        )
     except Exception as e:
-        log.exception("library backtest failed: %s", e)
+        log.exception("backtest failed: %s", e)
         send_telegram(
-            f"<b>Library backtest failed</b>\n{e}",
+            f"<b>Backtest failed</b>\n{e}",
             reply_to_message_id=reply_to_message_id,
         )
 
