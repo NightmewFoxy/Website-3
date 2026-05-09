@@ -1725,6 +1725,420 @@ def _d2s50_sig(p, i):
 _register("e50_pivot_rev", "Pivot Point Reversion", _d2s50_pre, _d2s50_sig, None, group="discover2")
 
 
+# 51. Candlestick hammer
+def _d2s51_pre(df):
+    return {"o": df["open"], "h": df["high"], "l": df["low"], "c": df["close"],
+            "rsi": rsi(df["close"], 14)}
+def _d2s51_sig(p, i):
+    o = p["o"].iloc[i]; h = p["h"].iloc[i]; l = p["l"].iloc[i]; c = p["c"].iloc[i]
+    r = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (o, h, l, c, r)): return None
+    body = abs(c - o); rng = h - l
+    if rng <= 0: return None
+    upper_wick = h - max(o, c); lower_wick = min(o, c) - l
+    body_top = max(o, c)
+    in_upper_third = (body_top - l) >= 2 * rng / 3
+    if lower_wick >= 2 * body and in_upper_third and r < 50: return "LONG"
+    if upper_wick >= 2 * body and (h - max(o, c)) >= 0 and (max(o,c) - l) <= rng / 3 and r > 50:
+        return "SHORT"
+    return None
+_register("e51_hammer", "Hammer Candle", _d2s51_pre, _d2s51_sig, None, group="discover2")
+
+
+# 52. Engulfing pattern
+def _d2s52_pre(df):
+    return {"o": df["open"], "c": df["close"], "v": df["volume"],
+            "vsma": df["volume"].rolling(20).mean()}
+def _d2s52_sig(p, i):
+    if i < 1: return None
+    o0 = p["o"].iloc[i-1]; c0 = p["c"].iloc[i-1]
+    o1 = p["o"].iloc[i]; c1 = p["c"].iloc[i]
+    v = p["v"].iloc[i]; vs = p["vsma"].iloc[i]
+    if any(pd.isna(x) for x in (o0, c0, o1, c1, v, vs)): return None
+    if v <= vs: return None
+    if c0 < o0 and c1 > o1 and o1 <= c0 and c1 >= o0: return "LONG"
+    if c0 > o0 and c1 < o1 and o1 >= c0 and c1 <= o0: return "SHORT"
+    return None
+_register("e52_engulfing", "Engulfing Pattern", _d2s52_pre, _d2s52_sig, None, group="discover2")
+
+
+# 53. Morning star simplified
+def _d2s53_pre(df):
+    return {"o": df["open"], "c": df["close"]}
+def _d2s53_sig(p, i):
+    if i < 2: return None
+    o = p["o"]; c = p["c"]
+    o0, c0 = o.iloc[i-2], c.iloc[i-2]
+    o1, c1 = o.iloc[i-1], c.iloc[i-1]
+    o2, c2 = o.iloc[i], c.iloc[i]
+    if any(pd.isna(x) for x in (o0, c0, o1, c1, o2, c2)): return None
+    body0 = abs(c0 - o0); body1 = abs(c1 - o1); body2 = abs(c2 - o2)
+    mid0 = (o0 + c0) / 2
+    if body0 == 0: return None
+    if c0 < o0 and body1 < body0 / 2 and c2 > o2 and c2 > mid0: return "LONG"
+    if c0 > o0 and body1 < body0 / 2 and c2 < o2 and c2 < mid0: return "SHORT"
+    return None
+_register("e53_morning_star", "Morning/Evening Star", _d2s53_pre, _d2s53_sig, None, group="discover2")
+
+
+# 54. Three white soldiers / black crows
+def _d2s54_pre(df):
+    return {"o": df["open"], "h": df["high"], "l": df["low"], "c": df["close"]}
+def _d2s54_sig(p, i):
+    if i < 2: return None
+    o = p["o"]; h = p["h"]; l = p["l"]; c = p["c"]
+    bull = lambda k: c.iloc[k] > o.iloc[k] and (c.iloc[k] - l.iloc[k]) > 0.7 * (h.iloc[k] - l.iloc[k])
+    bear = lambda k: c.iloc[k] < o.iloc[k] and (h.iloc[k] - c.iloc[k]) > 0.7 * (h.iloc[k] - l.iloc[k])
+    inside = lambda k_curr, k_prev: o.iloc[k_curr] >= min(o.iloc[k_prev], c.iloc[k_prev]) and o.iloc[k_curr] <= max(o.iloc[k_prev], c.iloc[k_prev])
+    try:
+        if bull(i) and bull(i-1) and bull(i-2) and inside(i, i-1) and inside(i-1, i-2): return "LONG"
+        if bear(i) and bear(i-1) and bear(i-2) and inside(i, i-1) and inside(i-1, i-2): return "SHORT"
+    except Exception:
+        return None
+    return None
+_register("e54_three_soldiers", "Three Soldiers/Crows", _d2s54_pre, _d2s54_sig, None, group="discover2")
+
+
+# 55. Doji reversal
+def _d2s55_pre(df):
+    return {"o": df["open"], "h": df["high"], "l": df["low"], "c": df["close"],
+            "rsi": rsi(df["close"], 14)}
+def _d2s55_sig(p, i):
+    if i < 2: return None
+    o = p["o"]; h = p["h"]; l = p["l"]; c = p["c"]
+    o2, c2 = o.iloc[i], c.iloc[i]; h2, l2 = h.iloc[i], l.iloc[i]
+    o0, c0 = o.iloc[i-2], c.iloc[i-2]
+    o1, c1 = o.iloc[i-1], c.iloc[i-1]
+    r = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (o0, c0, o1, c1, o2, c2, h2, l2, r)): return None
+    rng = h2 - l2
+    if rng <= 0: return None
+    body_pct = abs(c2 - o2) / rng
+    if body_pct >= 0.1: return None
+    if c0 < o0 and c1 < o1 and r < 45: return "LONG"
+    if c0 > o0 and c1 > o1 and r > 55: return "SHORT"
+    return None
+_register("e55_doji_reversal", "Doji Reversal", _d2s55_pre, _d2s55_sig, None, group="discover2")
+
+
+# 56. Tweezer bottom/top
+def _d2s56_pre(df):
+    return {"o": df["open"], "h": df["high"], "l": df["low"], "c": df["close"]}
+def _d2s56_sig(p, i):
+    if i < 1: return None
+    l0, l1 = p["l"].iloc[i-1], p["l"].iloc[i]
+    h0, h1 = p["h"].iloc[i-1], p["h"].iloc[i]
+    o0, c0 = p["o"].iloc[i-1], p["c"].iloc[i-1]
+    o1, c1 = p["o"].iloc[i], p["c"].iloc[i]
+    if any(pd.isna(x) for x in (l0, l1, h0, h1, o0, c0, o1, c1)): return None
+    if l0 > 0 and abs(l0 - l1) / l0 < 0.001 and c0 < o0 and c1 > o1: return "LONG"
+    if h0 > 0 and abs(h0 - h1) / h0 < 0.001 and c0 > o0 and c1 < o1: return "SHORT"
+    return None
+_register("e56_tweezer", "Tweezer Bottom/Top", _d2s56_pre, _d2s56_sig, None, group="discover2")
+
+
+# 57. Harami pattern
+def _d2s57_pre(df):
+    return {"o": df["open"], "c": df["close"], "rsi": rsi(df["close"], 14)}
+def _d2s57_sig(p, i):
+    if i < 1: return None
+    o0, c0 = p["o"].iloc[i-1], p["c"].iloc[i-1]
+    o1, c1 = p["o"].iloc[i], p["c"].iloc[i]
+    r = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (o0, c0, o1, c1, r)): return None
+    big_bear = c0 < o0 and (o0 - c0) > 0
+    inside_bull = c1 > o1 and o1 >= c0 and c1 <= o0
+    big_bull = c0 > o0 and (c0 - o0) > 0
+    inside_bear = c1 < o1 and o1 <= c0 and c1 >= o0
+    if big_bear and inside_bull and r < 50: return "LONG"
+    if big_bull and inside_bear and r > 50: return "SHORT"
+    return None
+_register("e57_harami", "Harami Pattern", _d2s57_pre, _d2s57_sig, None, group="discover2")
+
+
+# 58. Kicker pattern
+def _d2s58_pre(df):
+    return {"o": df["open"], "c": df["close"], "rsi": rsi(df["close"], 14)}
+def _d2s58_sig(p, i):
+    if i < 1: return None
+    o0, c0 = p["o"].iloc[i-1], p["c"].iloc[i-1]
+    o1, c1 = p["o"].iloc[i], p["c"].iloc[i]
+    r = p["rsi"].iloc[i]
+    if any(pd.isna(x) for x in (o0, c0, o1, c1, r)): return None
+    if c0 < o0 and c1 > o1 and o1 > o0 and r < 55: return "LONG"
+    if c0 > o0 and c1 < o1 and o1 < o0 and r > 45: return "SHORT"
+    return None
+_register("e58_kicker", "Kicker Pattern", _d2s58_pre, _d2s58_sig, None, group="discover2")
+
+
+# 59. OBV divergence
+def _d2s59_pre(df):
+    return {"obv": obv(df["close"], df["volume"]), "low": df["low"], "high": df["high"]}
+def _d2s59_sig(p, i):
+    if i < 10: return None
+    obvc = p["obv"].iloc[i]; obvb = p["obv"].iloc[i-10]
+    lc = p["low"].iloc[i]; lb = p["low"].iloc[i-10]
+    hc = p["high"].iloc[i]; hb = p["high"].iloc[i-10]
+    if any(pd.isna(x) for x in (obvc, obvb, lc, lb, hc, hb)): return None
+    if lc < lb and obvc > obvb: return "LONG"
+    if hc > hb and obvc < obvb: return "SHORT"
+    return None
+_register("e59_obv_div", "OBV Divergence", _d2s59_pre, _d2s59_sig, None, group="discover2")
+
+
+# 60. Accumulation/Distribution divergence
+def _d2s60_pre(df):
+    mfm = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / (df["high"] - df["low"]).replace(0, np.nan)
+    mfv = (mfm * df["volume"]).fillna(0)
+    return {"ad": mfv.cumsum(), "close": df["close"]}
+def _d2s60_sig(p, i):
+    if i < 5: return None
+    ac = p["ad"].iloc[i]; ab = p["ad"].iloc[i-5]
+    cc = p["close"].iloc[i]; cb = p["close"].iloc[i-5]
+    if any(pd.isna(x) for x in (ac, ab, cc, cb)): return None
+    if ac > ab and cc < cb: return "LONG"
+    if ac < ab and cc > cb: return "SHORT"
+    return None
+_register("e60_ad_div", "AD Divergence", _d2s60_pre, _d2s60_sig, None, group="discover2")
+
+
+# 61. Money Flow Index reversion
+def _d2s61_pre(df, period=14):
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    raw_mf = typical * df["volume"]
+    delta = typical.diff()
+    pos_mf = pd.Series(np.where(delta > 0, raw_mf, 0), index=df.index)
+    neg_mf = pd.Series(np.where(delta < 0, raw_mf, 0), index=df.index)
+    mfr = pos_mf.rolling(period).sum() / neg_mf.rolling(period).sum().replace(0, np.nan)
+    mfi = 100 - (100 / (1 + mfr))
+    return {"mfi": mfi}
+def _d2s61_sig(p, i):
+    if i < 1: return None
+    pp = p["mfi"].iloc[i-1]; pc = p["mfi"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= 20 and pc > 20: return "LONG"
+    if pp >= 80 and pc < 80: return "SHORT"
+    return None
+_register("e61_mfi", "MFI Reversion", _d2s61_pre, _d2s61_sig, None, group="discover2")
+
+
+# 62. CCI cross +/- 100
+def _cci(df, period=20):
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    sma = tp.rolling(period).mean()
+    md = tp.rolling(period).apply(lambda x: float(np.mean(np.abs(x - x.mean()))) if not np.any(np.isnan(x)) else float("nan"), raw=False)
+    return (tp - sma) / (0.015 * md.replace(0, np.nan))
+def _d2s62_pre(df):
+    return {"cci": _cci(df, 20)}
+def _d2s62_sig(p, i):
+    if i < 1: return None
+    pp = p["cci"].iloc[i-1]; pc = p["cci"].iloc[i]
+    if pd.isna(pp) or pd.isna(pc): return None
+    if pp <= -100 and pc > -100: return "LONG"
+    if pp >= 100 and pc < 100: return "SHORT"
+    return None
+_register("e62_cci", "CCI Cross +/-100", _d2s62_pre, _d2s62_sig, None, group="discover2")
+
+
+# 63. CCI extreme reversion
+def _d2s63_pre(df):
+    return {"cci": _cci(df, 20)}
+def _d2s63_sig(p, i):
+    if i < 2: return None
+    cur = p["cci"].iloc[i]; prev = p["cci"].iloc[i-1]; prev2 = p["cci"].iloc[i-2]
+    if any(pd.isna(x) for x in (cur, prev, prev2)): return None
+    if prev < -200 and cur > prev: return "LONG"
+    if prev > 200 and cur < prev: return "SHORT"
+    return None
+_register("e63_cci_extreme", "CCI Extreme Reversion", _d2s63_pre, _d2s63_sig, None, group="discover2")
+
+
+# 64. Woodies CCI (zero cross after 6+ bars below)
+def _d2s64_pre(df):
+    return {"cci": _cci(df, 20)}
+def _d2s64_sig(p, i):
+    if i < 7: return None
+    cur = p["cci"].iloc[i]; prev = p["cci"].iloc[i-1]
+    if pd.isna(cur) or pd.isna(prev): return None
+    if prev <= 0 and cur > 0:
+        prior = [p["cci"].iloc[i-k] for k in range(2, 8)]
+        if all(pd.notna(v) and v < 0 for v in prior): return "LONG"
+    if prev >= 0 and cur < 0:
+        prior = [p["cci"].iloc[i-k] for k in range(2, 8)]
+        if all(pd.notna(v) and v > 0 for v in prior): return "SHORT"
+    return None
+_register("e64_woodies_cci", "Woodies CCI", _d2s64_pre, _d2s64_sig, None, group="discover2")
+
+
+# 65. DPO reversion (% of price)
+def _d2s65_pre(df, period=20):
+    shift = period // 2 + 1
+    sma = df["close"].rolling(period).mean()
+    dpo = df["close"] - sma.shift(shift)
+    dpo_pct = 100 * dpo / df["close"]
+    return {"dpo_pct": dpo_pct}
+def _d2s65_sig(p, i):
+    if i < 1: return None
+    cur = p["dpo_pct"].iloc[i]; prev = p["dpo_pct"].iloc[i-1]
+    if pd.isna(cur) or pd.isna(prev): return None
+    if prev < -2 and cur > prev: return "LONG"
+    if prev > 2 and cur < prev: return "SHORT"
+    return None
+_register("e65_dpo_rev", "DPO % Reversion", _d2s65_pre, _d2s65_sig, None, group="discover2")
+
+
+# 66. Price - MA distance
+def _d2s66_pre(df):
+    sma = df["close"].rolling(50).mean()
+    diff_pct = 100 * (df["close"] - sma) / sma.replace(0, np.nan)
+    return {"diff_pct": diff_pct, "rsi": rsi(df["close"], 14)}
+def _d2s66_sig(p, i):
+    d = p["diff_pct"].iloc[i]; r = p["rsi"].iloc[i]
+    if pd.isna(d) or pd.isna(r): return None
+    if d < -3 and r < 40: return "LONG"
+    if d > 3 and r > 60: return "SHORT"
+    return None
+_register("e66_price_ma_dist", "Price-MA Distance", _d2s66_pre, _d2s66_sig, None, group="discover2")
+
+
+# 67. ROC10 zero cross + ROC3 confirmation
+def _d2s67_pre(df):
+    return {"roc10": _roc(df["close"], 10), "roc3": _roc(df["close"], 3)}
+def _d2s67_sig(p, i):
+    if i < 1: return None
+    pp = p["roc10"].iloc[i-1]; pc = p["roc10"].iloc[i]
+    r3 = p["roc3"].iloc[i]
+    if any(pd.isna(x) for x in (pp, pc, r3)): return None
+    if pp <= 0 and pc > 0 and r3 > 0: return "LONG"
+    if pp >= 0 and pc < 0 and r3 < 0: return "SHORT"
+    return None
+_register("e67_roc_momentum", "ROC Momentum", _d2s67_pre, _d2s67_sig, None, group="discover2")
+
+
+# 68. Triple ROC
+def _d2s68_pre(df):
+    return {"r5": _roc(df["close"], 5), "r10": _roc(df["close"], 10), "r20": _roc(df["close"], 20)}
+def _d2s68_sig(p, i):
+    if i < 1: return None
+    r5c = p["r5"].iloc[i]; r10c = p["r10"].iloc[i]; r20c = p["r20"].iloc[i]
+    r5p = p["r5"].iloc[i-1]; r10p = p["r10"].iloc[i-1]; r20p = p["r20"].iloc[i-1]
+    if any(pd.isna(x) for x in (r5c, r10c, r20c, r5p, r10p, r20p)): return None
+    if r5c > 0 and r10c > 0 and r20c > 0 and (r5p < 0 or r10p < 0 or r20p < 0): return "LONG"
+    if r5c < 0 and r10c < 0 and r20c < 0 and (r5p > 0 or r10p > 0 or r20p > 0): return "SHORT"
+    return None
+_register("e68_triple_roc", "Triple ROC", _d2s68_pre, _d2s68_sig, None, group="discover2")
+
+
+# 69. Momentum with signal
+def _d2s69_pre(df, period=10):
+    mom = df["close"] - df["close"].shift(period)
+    return {"mom": mom, "sig": ema(mom, 3)}
+def _d2s69_sig(p, i):
+    if i < 1: return None
+    if _crosses(p["mom"].iloc[i-1], p["mom"].iloc[i], p["sig"].iloc[i-1], p["sig"].iloc[i], "up"):
+        return "LONG"
+    if _crosses(p["mom"].iloc[i-1], p["mom"].iloc[i], p["sig"].iloc[i-1], p["sig"].iloc[i], "down"):
+        return "SHORT"
+    return None
+_register("e69_momentum_sig", "Momentum + Signal", _d2s69_pre, _d2s69_sig, None, group="discover2")
+
+
+# 70. Disparity Index
+def _d2s70_pre(df, period=14):
+    sma = df["close"].rolling(period).mean()
+    return {"disp": 100 * (df["close"] - sma) / sma.replace(0, np.nan)}
+def _d2s70_sig(p, i):
+    if i < 1: return None
+    cur = p["disp"].iloc[i]; prev = p["disp"].iloc[i-1]
+    if pd.isna(cur) or pd.isna(prev): return None
+    if cur < -3 and cur > prev: return "LONG"
+    if cur > 3 and cur < prev: return "SHORT"
+    return None
+_register("e70_disparity", "Disparity Index", _d2s70_pre, _d2s70_sig, None, group="discover2")
+
+
+# 71. Price acceleration
+def _d2s71_pre(df):
+    accel = df["close"].diff().diff()
+    return {"accel": accel, "close": df["close"]}
+def _d2s71_sig(p, i):
+    if i < 2: return None
+    pa = p["accel"].iloc[i-1]; ca = p["accel"].iloc[i]
+    cp = p["close"].iloc[i-1]; cpp = p["close"].iloc[i-2]
+    if any(pd.isna(x) for x in (pa, ca, cp, cpp)): return None
+    falling_before = cp < cpp
+    rising_before = cp > cpp
+    if pa <= 0 and ca > 0 and falling_before: return "LONG"
+    if pa >= 0 and ca < 0 and rising_before: return "SHORT"
+    return None
+_register("e71_accel", "Price Acceleration", _d2s71_pre, _d2s71_sig, None, group="discover2")
+
+
+# 72. Bandwidth percentile
+def _d2s72_pre(df, lookback=252):
+    u, m, l = compute_bollinger_bands(df["close"], 20, 2.0)
+    bw = (u - l) / m.replace(0, np.nan)
+    pct = bw.rolling(lookback).rank(pct=True)
+    return {"bw_pct": pct, "rsi": rsi(df["close"], 14)}
+def _d2s72_sig(p, i):
+    bw = p["bw_pct"].iloc[i]; r = p["rsi"].iloc[i]
+    if pd.isna(bw) or pd.isna(r): return None
+    if bw < 0.20 and r < 45: return "LONG"
+    if bw < 0.20 and r > 55: return "SHORT"
+    return None
+_register("e72_bw_pct", "Bandwidth Percentile + RSI", _d2s72_pre, _d2s72_sig, None, group="discover2")
+
+
+# 73. Volatility ratio
+def _d2s73_pre(df):
+    a = atr(df["high"], df["low"], df["close"], 14)
+    return {"vr": a / a.rolling(20).mean().replace(0, np.nan)}
+def _d2s73_sig(p, i):
+    if i < 10: return None
+    cur = p["vr"].iloc[i]
+    if pd.isna(cur) or cur >= 0.7: return None
+    spike = any(pd.notna(p["vr"].iloc[i-k]) and p["vr"].iloc[i-k] > 1.3 for k in range(1, 11))
+    if not spike: return None
+    return "LONG"
+_register("e73_vol_ratio", "Volatility Ratio Reversion", _d2s73_pre, _d2s73_sig, None, group="discover2")
+
+
+# 74. Historical volatility reversion
+def _d2s74_pre(df, period=10):
+    log_ret = np.log(df["close"] / df["close"].shift(1))
+    hv = log_ret.rolling(period).std() * np.sqrt(8760) * 100  # annualize for hourly
+    return {"hv": hv}
+def _d2s74_sig(p, i):
+    if i < 5: return None
+    cur = p["hv"].iloc[i]
+    if pd.isna(cur) or cur >= 30: return None
+    spike = any(pd.notna(p["hv"].iloc[i-k]) and p["hv"].iloc[i-k] > 60 for k in range(1, 6))
+    if not spike: return None
+    return "LONG"
+def _d2s74_exit(p, i, d):
+    if i < 1: return False
+    cur = p["hv"].iloc[i]; prev = p["hv"].iloc[i-1]
+    if pd.isna(cur) or pd.isna(prev): return False
+    if d == "LONG" and cur > prev: return f"HV rising ({cur:.1f})"
+    return False
+_register("e74_hv_rev", "Historical Volatility Reversion", _d2s74_pre, _d2s74_sig, _d2s74_exit, group="discover2")
+
+
+# 75. Z-score mean reversion
+def _d2s75_pre(df, period=20):
+    sma = df["close"].rolling(period).mean()
+    sd = df["close"].rolling(period).std().replace(0, np.nan)
+    return {"z": (df["close"] - sma) / sd}
+def _d2s75_sig(p, i):
+    if i < 1: return None
+    cur = p["z"].iloc[i]; prev = p["z"].iloc[i-1]
+    if pd.isna(cur) or pd.isna(prev): return None
+    if prev < -2 and cur > prev: return "LONG"
+    if prev > 2 and cur < prev: return "SHORT"
+    return None
+_register("e75_zscore", "Z-Score Mean Reversion", _d2s75_pre, _d2s75_sig, None, group="discover2")
+
+
 def handle_discover2_command(reply_to_message_id: int | None = None) -> None:
     global discover_running
     with discover_lock:
