@@ -3651,8 +3651,10 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame | None =
 
 def handle_backtest_command(reply_to_message_id: int | None = None) -> None:
     log.info("Processing /backtest command")
+    strat = _resolve_active_strategy()
+    strat_name = strat.name if strat else "(no active strategy)"
     send_telegram(
-        "<b>Williams %R backtest started (backtesting.py engine)</b>\n"
+        f"<b>{strat_name} backtest started (backtesting.py engine)</b>\n"
         "Running BTCUSDT 6-month POC first. If Sharpe > 1.0 and Expectancy > 0, "
         "will expand to all 20 pairs. Otherwise stops and reports POC stats.",
         reply_to_message_id=reply_to_message_id,
@@ -3673,68 +3675,86 @@ def _klines_to_bt_df(df: pd.DataFrame) -> pd.DataFrame:
     return out[["Open", "High", "Low", "Close", "Volume"]]
 
 
-def _build_mean_reversion_strategy():
+def _build_active_strategy_class(strat: "_Strategy"):
+    """Wrap a registered _Strategy as a backtesting.py Strategy that delegates
+    to the strategy's precompute / entry_signal_at / exit_reasons_at."""
     from backtesting import Strategy
 
-    class BbRsiStrategy(Strategy):
-        bb_period = 20
-        bb_std = 2.0
-        rsi_oversold = 30
-        rsi_overbought = 70
-        sl_mult = 1.0
-        tp_mult = 2.0
+    captured_strat = strat
+    sl_mult_default = strat.sl_mult
+    tp_mult_default = strat.tp_mult
+
+    class ActiveStrategy(Strategy):
+        sl_mult = sl_mult_default
+        tp_mult = tp_mult_default
 
         def init(self):
-            close = pd.Series(self.data.Close)
-            high = pd.Series(self.data.High)
-            low = pd.Series(self.data.Low)
-
-            self.rsi14 = self.I(lambda: rsi(close, 14).values, name="RSI14")
-            bb_u, bb_m, bb_l = compute_bollinger_bands(close, self.bb_period, self.bb_std)
-            self.bb_upper = self.I(lambda: bb_u.values, name="BB_upper")
-            self.bb_middle = self.I(lambda: bb_m.values, name="BB_middle")
-            self.bb_lower = self.I(lambda: bb_l.values, name="BB_lower")
-            self.atr14 = self.I(lambda: atr(high, low, close, 14).values, name="ATR14")
+            # Reconstruct a pandas DataFrame so the strategy's precompute
+            # function can run unchanged. Indicators are causal so computing
+            # on the full series introduces no look-ahead bias.
+            idx = self.data.index
+            df_full = pd.DataFrame({
+                "open": np.asarray(self.data.Open),
+                "high": np.asarray(self.data.High),
+                "low": np.asarray(self.data.Low),
+                "close": np.asarray(self.data.Close),
+                "volume": np.asarray(self.data.Volume),
+            }, index=idx)
+            df_full["close_time"] = idx
+            self._precomp = captured_strat.precompute(df_full)
+            self._strat = captured_strat
 
         def next(self):
-            n = len(self.data.Close)
-            if n < max(self.bb_period, 14) + 1:
+            i = len(self.data.Close) - 1
+            if i < 50:
                 return
 
-            price = float(self.data.Close[-1])
-            rsi_now = float(self.rsi14[-1])
-            bb_lower_now = float(self.bb_lower[-1])
-            bb_upper_now = float(self.bb_upper[-1])
-            bb_middle_now = float(self.bb_middle[-1])
-            atr_val = float(self.atr14[-1])
-
-            if any(np.isnan(x) for x in (rsi_now, bb_lower_now, bb_upper_now,
-                                          bb_middle_now, atr_val)):
+            atr_val = float("nan")
+            if "atr" in self._precomp:
+                v = self._precomp["atr"].iloc[i]
+                if pd.notna(v):
+                    atr_val = float(v)
+            if np.isnan(atr_val) or atr_val <= 0:
                 return
 
             if self.position:
-                if self.position.is_long:
-                    if rsi_now > self.rsi_overbought or price > bb_middle_now:
-                        self.position.close()
-                else:
-                    if rsi_now < self.rsi_oversold or price < bb_middle_now:
-                        self.position.close()
+                d = "LONG" if self.position.is_long else "SHORT"
+                exits = self._strat.exit_reasons_at(self._precomp, i, d)
+                if exits:
+                    self.position.close()
                 return
 
-            if rsi_now < self.rsi_oversold and price < bb_lower_now:
+            sig = self._strat.entry_signal_at(self._precomp, i)
+            if sig is None:
+                return
+
+            price = float(self.data.Close[-1])
+            if sig == "LONG":
                 tp = price + self.tp_mult * atr_val
                 sl = price - self.sl_mult * atr_val
                 self.buy(sl=sl, tp=tp)
-            elif rsi_now > self.rsi_overbought and price > bb_upper_now:
+            elif sig == "SHORT":
                 tp = price - self.tp_mult * atr_val
                 sl = price + self.sl_mult * atr_val
                 self.sell(sl=sl, tp=tp)
 
-    return BbRsiStrategy
+    return ActiveStrategy
+
+
+def _resolve_active_strategy() -> "_Strategy | None":
+    sid = active_strategy_id
+    if sid and sid in STRATEGIES_BY_ID:
+        return STRATEGIES_BY_ID[sid]
+    return None
 
 
 def _run_pair_library_backtest(symbol: str) -> dict | None:
     from backtesting import Backtest
+
+    strat = _resolve_active_strategy()
+    if strat is None:
+        log.warning("backtest %s: no active strategy", symbol)
+        return None
 
     df = fetch_klines_paginated(symbol, "1h", target=4320)
     if len(df) < 200:
@@ -3742,19 +3762,12 @@ def _run_pair_library_backtest(symbol: str) -> dict | None:
         return None
 
     bt_df = _klines_to_bt_df(df)
-    Strategy = _build_mean_reversion_strategy()
+    StrategyCls = _build_active_strategy_class(strat)
     bt = Backtest(
-        bt_df, Strategy,
+        bt_df, StrategyCls,
         cash=10000, commission=0.001, exclusive_orders=True,
     )
-    stats = bt.run(
-        bb_period=params["bb_period"],
-        bb_std=params["bb_std"],
-        rsi_oversold=params["rsi_oversold"],
-        rsi_overbought=params["rsi_overbought"],
-        sl_mult=params["sl_mult"],
-        tp_mult=params["tp_mult"],
-    )
+    stats = bt.run()
 
     def _f(key, default=0.0):
         v = stats.get(key, default)
@@ -3782,17 +3795,27 @@ def _run_pair_library_backtest(symbol: str) -> dict | None:
 
 def _run_backtest(reply_to_message_id: int | None) -> None:
     try:
-        log.info("library backtest: starting BTCUSDT POC")
+        active = _resolve_active_strategy()
+        if active is None:
+            send_telegram(
+                "Backtest aborted: no active strategy registered.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        strat_name = active.name
+        strat_id = active.id
+        log.info("library backtest: starting BTCUSDT POC for %s (%s)", strat_name, strat_id)
         btc = _run_pair_library_backtest("BTCUSDT")
         if btc is None:
             send_telegram(
-                "Library backtest aborted: insufficient BTCUSDT data.",
+                f"{strat_name} backtest aborted: insufficient BTCUSDT data.",
                 reply_to_message_id=reply_to_message_id,
             )
             return
 
         poc_msg = (
-            "<b>Williams %R backtest POC: BTCUSDT</b>\n"
+            f"<b>{strat_name} backtest POC: BTCUSDT</b>\n"
+            f"<i>Strategy ID: {strat_id}</i>\n"
             f"Range: {btc['start']} -> {btc['end']}\n"
             f"Trades: {btc['trades']}\n"
             f"Win Rate: {btc['wr']:.2f}%\n"
@@ -3854,7 +3877,8 @@ def _run_backtest(reply_to_message_id: int | None) -> None:
         exp_avg = sum(r["expectancy"] for r in all_results) / len(all_results)
         ret_total = sum(r["ret"] for r in all_results)
 
-        lines = ["<b>Williams %R backtest: 20-pair results</b>"]
+        lines = [f"<b>{strat_name} backtest: 20-pair results</b>",
+                 f"<i>Strategy ID: {strat_id}</i>"]
         lines.append("<pre>")
         lines.append(
             f"{'Pair':<10}{'T':>4}{'WR%':>7}{'Shrp':>7}{'DD%':>7}{'Exp%':>8}{'Ret%':>8}"
