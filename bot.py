@@ -50,12 +50,12 @@ PARAMS_PATH = os.environ.get(
 )
 
 DEFAULT_PARAMS: dict = {
-    "rsi_oversold": 25,
-    "rsi_overbought": 75,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "bb_period": 20,
     "bb_std": 2.0,
-    "volume_mult": 1.1,
     "sl_mult": 1.0,
-    "tp_mult": 1.5,
+    "tp_mult": 2.0,
 }
 
 params: dict = dict(DEFAULT_PARAMS)
@@ -92,8 +92,7 @@ def save_params() -> None:
 def params_text() -> str:
     return (
         f"RSI {params['rsi_oversold']}/{params['rsi_overbought']}, "
-        f"BB std {params['bb_std']}, "
-        f"vol x{params['volume_mult']}, "
+        f"BB({params['bb_period']}, {params['bb_std']}), "
         f"SL {params['sl_mult']}xATR, "
         f"TP {params['tp_mult']}xATR"
     )
@@ -253,46 +252,6 @@ def compute_bollinger_bands(close: pd.Series, period: int = 20, std: float = 2.0
     return upper, middle, lower
 
 
-def compute_ema_slope(series: pd.Series, period: int = 50, lookback: int = 3) -> pd.Series:
-    e = ema(series, period)
-    return e - e.shift(lookback)
-
-
-def compute_stoch_rsi(close: pd.Series, rsi_period: int = 14, stoch_period: int = 14) -> pd.Series:
-    rsi_series = rsi(close, rsi_period)
-    rsi_min = rsi_series.rolling(window=stoch_period).min()
-    rsi_max = rsi_series.rolling(window=stoch_period).max()
-    rng = (rsi_max - rsi_min).replace(0, np.nan)
-    return 100 * (rsi_series - rsi_min) / rng
-
-
-def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-
-    up_move = high - high.shift(1)
-    down_move = low.shift(1) - low
-    plus_dm = pd.Series(
-        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
-        index=high.index,
-    )
-    minus_dm = pd.Series(
-        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
-        index=high.index,
-    )
-
-    alpha = 1 / period
-    atr_w = tr.ewm(alpha=alpha, adjust=False).mean()
-    plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_w.replace(0, np.nan)
-    minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_w.replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.ewm(alpha=alpha, adjust=False).mean()
-
-
 _4h_trend_cache: dict[str, str] = {}
 _cache_lock = threading.Lock()
 
@@ -312,88 +271,39 @@ def get_4h_trend(symbol: str) -> str:
 
 def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     close = df["close"]
-    volume = df["volume"]
     high = df["high"]
     low = df["low"]
 
     rsi14 = rsi(close, 14)
-    bb_upper, bb_middle, bb_lower = compute_bollinger_bands(close, 20, params["bb_std"])
-    ema50 = ema(close, 50)
-    ema50_slope = ema50 - ema50.shift(3)
-    obv_line = obv(close, volume)
-    obv_ema = ema(obv_line, 20)
+    bb_upper, bb_middle, bb_lower = compute_bollinger_bands(
+        close, params["bb_period"], params["bb_std"]
+    )
     atr14 = atr(high, low, close, 14)
-    stoch_rsi_series = compute_stoch_rsi(close, 14, 14)
 
     price = float(close.iloc[-1])
     rsi_now = rsi14.iloc[-1]
     bb_upper_now = bb_upper.iloc[-1]
-    bb_lower_now = bb_lower.iloc[-1]
     bb_middle_now = bb_middle.iloc[-1]
-    slope_now = ema50_slope.iloc[-1]
-    obv_now = obv_line.iloc[-1]
-    obv_ema_now = obv_ema.iloc[-1]
+    bb_lower_now = bb_lower.iloc[-1]
     atr_now = atr14.iloc[-1]
-    stoch_now = stoch_rsi_series.iloc[-1]
-    stoch_prev = stoch_rsi_series.iloc[-2] if len(stoch_rsi_series) >= 2 else float("nan")
 
-    recent_rsi_low = any(
-        pd.notna(rsi14.iloc[-i]) and rsi14.iloc[-i] < 30 for i in (1, 2, 3) if len(rsi14) >= i
-    )
-    recent_rsi_high = any(
-        pd.notna(rsi14.iloc[-i]) and rsi14.iloc[-i] > 70 for i in (1, 2, 3) if len(rsi14) >= i
-    )
-    recent_bb_long_touch = any(
-        pd.notna(low.iloc[-i]) and pd.notna(bb_lower.iloc[-i]) and low.iloc[-i] <= bb_lower.iloc[-i]
-        for i in (1, 2, 3) if len(low) >= i
-    )
-    recent_bb_short_touch = any(
-        pd.notna(high.iloc[-i]) and pd.notna(bb_upper.iloc[-i]) and high.iloc[-i] >= bb_upper.iloc[-i]
-        for i in (1, 2, 3) if len(high) >= i
-    )
+    rsi_oversold = params["rsi_oversold"]
+    rsi_overbought = params["rsi_overbought"]
 
-    near_lower = (
-        pd.notna(bb_lower_now)
-        and abs(price - float(bb_lower_now)) <= 0.002 * price
+    long_entry = (
+        pd.notna(rsi_now) and pd.notna(bb_lower_now)
+        and rsi_now < rsi_oversold and price < float(bb_lower_now)
     )
-    near_upper = (
-        pd.notna(bb_upper_now)
-        and abs(price - float(bb_upper_now)) <= 0.002 * price
+    short_entry = (
+        pd.notna(rsi_now) and pd.notna(bb_upper_now)
+        and rsi_now > rsi_overbought and price > float(bb_upper_now)
     )
-    slope_flat = pd.notna(slope_now) and abs(float(slope_now)) < 0.0015 * price
-    atr_ok = pd.notna(atr_now) and float(atr_now) >= 0.003 * price
-
-    stoch_long = (
-        pd.notna(stoch_now) and pd.notna(stoch_prev)
-        and stoch_now < 20 and stoch_now > stoch_prev
-    )
-    stoch_short = (
-        pd.notna(stoch_now) and pd.notna(stoch_prev)
-        and stoch_now > 80 and stoch_now < stoch_prev
-    )
-
-    c1_long = bool((pd.notna(rsi_now) and rsi_now < 35) or recent_rsi_low)
-    c2_long = bool(near_lower or recent_bb_long_touch)
-    c3_long = bool(stoch_long)
-    c4_long = bool(slope_flat)
-
-    c1_short = bool((pd.notna(rsi_now) and rsi_now > 65) or recent_rsi_high)
-    c2_short = bool(near_upper or recent_bb_short_touch)
-    c3_short = bool(stoch_short)
-    c4_short = bool(slope_flat)
-
-    long_count = sum([c1_long, c2_long, c3_long, c4_long])
-    short_count = sum([c1_short, c2_short, c3_short, c4_short])
 
     direction = None
-    if atr_ok:
-        if long_count == 4 and long_count >= short_count:
-            direction = "LONG"
-        elif short_count == 4:
-            direction = "SHORT"
-
-    obv_bull = obv_now > obv_ema_now
-    obv_bear = obv_now < obv_ema_now
+    if long_entry:
+        direction = "LONG"
+    elif short_entry:
+        direction = "SHORT"
 
     return {
         "direction": direction,
@@ -402,13 +312,7 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
         "bb_upper": float(bb_upper_now) if pd.notna(bb_upper_now) else 0.0,
         "bb_middle": float(bb_middle_now) if pd.notna(bb_middle_now) else 0.0,
         "bb_lower": float(bb_lower_now) if pd.notna(bb_lower_now) else 0.0,
-        "ema50_slope": float(slope_now) if pd.notna(slope_now) else 0.0,
-        "obv": float(obv_now),
-        "obv_ema": float(obv_ema_now),
-        "obv_trend": "bullish" if obv_bull else ("bearish" if obv_bear else "flat"),
-        "obv_bull": bool(obv_bull),
-        "obv_bear": bool(obv_bear),
-        "atr": float(atr_now),
+        "atr": float(atr_now) if pd.notna(atr_now) else 0.0,
         "candle_time": df["close_time"].iloc[-1],
     }
 
@@ -431,8 +335,6 @@ def format_message(symbol: str, r: dict) -> str:
         f"Price: {price:.6g}\n"
         f"RSI(14): {r['rsi']:.2f}\n"
         f"BB lower/mid/upper: {r['bb_lower']:.6g} / {r['bb_middle']:.6g} / {r['bb_upper']:.6g}\n"
-        f"OBV trend: {r['obv_trend']}\n"
-        f"EMA50 slope (3-bar): {r['ema50_slope']:+.6g}\n"
         f"ATR(14): {atr_v:.6g}\n"
         f"Take Profit: {tp:.6g}\n"
         f"Stop Loss: {sl:.6g}\n"
@@ -442,27 +344,21 @@ def format_message(symbol: str, r: dict) -> str:
 
 def check_long_exit(r: dict) -> list[str]:
     reasons = []
-    if r["rsi"] > 60:
-        reasons.append(f"RSI > 60 ({r['rsi']:.2f})")
-    if r["bb_middle"] > 0 and r["price"] >= r["bb_middle"]:
-        reasons.append("Price reached BB middle")
-    if r["obv_bear"]:
-        reasons.append("OBV dropped below EMA")
-    if len(reasons) < 2:
-        return []
+    rsi_overbought = params["rsi_overbought"]
+    if r["rsi"] > rsi_overbought:
+        reasons.append(f"RSI > {rsi_overbought} ({r['rsi']:.2f})")
+    if r["bb_middle"] > 0 and r["price"] > r["bb_middle"]:
+        reasons.append("Price closed above BB middle")
     return reasons
 
 
 def check_short_exit(r: dict) -> list[str]:
     reasons = []
-    if r["rsi"] < 40:
-        reasons.append(f"RSI < 40 ({r['rsi']:.2f})")
-    if r["bb_middle"] > 0 and r["price"] <= r["bb_middle"]:
-        reasons.append("Price reached BB middle")
-    if r["obv_bull"]:
-        reasons.append("OBV rose above EMA")
-    if len(reasons) < 2:
-        return []
+    rsi_oversold = params["rsi_oversold"]
+    if r["rsi"] < rsi_oversold:
+        reasons.append(f"RSI < {rsi_oversold} ({r['rsi']:.2f})")
+    if r["bb_middle"] > 0 and r["price"] < r["bb_middle"]:
+        reasons.append("Price closed below BB middle")
     return reasons
 
 
@@ -481,62 +377,57 @@ def score_pair(df: pd.DataFrame, symbol: str) -> tuple[str, int]:
     close = df["close"]
     high = df["high"]
     low = df["low"]
-    volume = df["volume"]
 
     rsi14 = rsi(close, 14)
-    bb_upper, bb_middle, bb_lower = compute_bollinger_bands(close, 20, params["bb_std"])
-    ema50 = ema(close, 50)
-    ema50_slope = ema50 - ema50.shift(3)
-    obv_line = obv(close, volume)
-    obv_ema_v = ema(obv_line, 20)
-    volume_sma20 = volume.rolling(window=20).mean()
+    bb_upper, bb_middle, bb_lower = compute_bollinger_bands(
+        close, params["bb_period"], params["bb_std"]
+    )
+    atr14 = atr(high, low, close, 14)
 
-    price = close.iloc[-1]
-    low_now, low_prev = low.iloc[-1], low.iloc[-2]
-    high_now, high_prev = high.iloc[-1], high.iloc[-2]
-    rsi_now, rsi_prev = rsi14.iloc[-1], rsi14.iloc[-2]
-    bb_upper_now, bb_upper_prev = bb_upper.iloc[-1], bb_upper.iloc[-2]
-    bb_lower_now, bb_lower_prev = bb_lower.iloc[-1], bb_lower.iloc[-2]
-    slope_now = ema50_slope.iloc[-1]
-    obv_now = obv_line.iloc[-1]
-    obv_ema_now = obv_ema_v.iloc[-1]
-    vol_now = volume.iloc[-1]
-    vol_sma_now = volume_sma20.iloc[-1]
+    price = float(close.iloc[-1])
+    rsi_now = rsi14.iloc[-1]
+    bb_upper_now = bb_upper.iloc[-1]
+    bb_lower_now = bb_lower.iloc[-1]
+    bb_middle_now = bb_middle.iloc[-1]
+    atr_now = atr14.iloc[-1]
+    low_now = float(low.iloc[-1])
+    high_now = float(high.iloc[-1])
 
     rsi_oversold = params["rsi_oversold"]
     rsi_overbought = params["rsi_overbought"]
 
-    rsi_long_revert = (rsi_now < rsi_oversold or rsi_prev < rsi_oversold) and rsi_now > rsi_prev
-    rsi_short_revert = (rsi_now > rsi_overbought or rsi_prev > rsi_overbought) and rsi_now < rsi_prev
-    bb_long_touch = pd.notna(bb_lower_now) and pd.notna(bb_lower_prev) and (
-        low_now <= bb_lower_now or low_prev <= bb_lower_prev
+    rsi_long = bool(pd.notna(rsi_now) and rsi_now < rsi_oversold)
+    rsi_short = bool(pd.notna(rsi_now) and rsi_now > rsi_overbought)
+
+    bb_outside_long = bool(
+        pd.notna(bb_lower_now) and (price <= float(bb_lower_now) or low_now <= float(bb_lower_now))
     )
-    bb_short_touch = pd.notna(bb_upper_now) and pd.notna(bb_upper_prev) and (
-        high_now >= bb_upper_now or high_prev >= bb_upper_prev
+    bb_outside_short = bool(
+        pd.notna(bb_upper_now) and (price >= float(bb_upper_now) or high_now >= float(bb_upper_now))
     )
-    inside_long = pd.notna(bb_lower_now) and price > bb_lower_now
-    inside_short = pd.notna(bb_upper_now) and price < bb_upper_now
-    obv_bull = obv_now > obv_ema_now
-    obv_bear = obv_now < obv_ema_now
-    volume_ok = bool(pd.notna(vol_sma_now) and vol_now >= params["volume_mult"] * vol_sma_now)
-    slope_long_ok = bool(pd.notna(slope_now) and slope_now >= 0)
-    slope_short_ok = bool(pd.notna(slope_now) and slope_now <= 0)
+
+    returning_long = bool(
+        pd.notna(bb_lower_now) and pd.notna(bb_middle_now)
+        and price > float(bb_lower_now) and price < float(bb_middle_now)
+    )
+    returning_short = bool(
+        pd.notna(bb_upper_now) and pd.notna(bb_middle_now)
+        and price < float(bb_upper_now) and price > float(bb_middle_now)
+    )
+
+    atr_ok = bool(pd.notna(atr_now) and float(atr_now) >= 0.003 * price)
 
     long_score = 0
-    if rsi_long_revert: long_score += 25
-    if bb_long_touch: long_score += 25
-    if obv_bull: long_score += 15
-    if volume_ok: long_score += 10
-    if slope_long_ok: long_score += 15
-    if inside_long: long_score += 10
+    if rsi_long: long_score += 40
+    if bb_outside_long: long_score += 40
+    if returning_long: long_score += 10
+    if atr_ok: long_score += 10
 
     short_score = 0
-    if rsi_short_revert: short_score += 25
-    if bb_short_touch: short_score += 25
-    if obv_bear: short_score += 15
-    if volume_ok: short_score += 10
-    if slope_short_ok: short_score += 15
-    if inside_short: short_score += 10
+    if rsi_short: short_score += 40
+    if bb_outside_short: short_score += 40
+    if returning_short: short_score += 10
+    if atr_ok: short_score += 10
 
     if long_score >= short_score:
         return "LONG", long_score
@@ -570,30 +461,28 @@ def handle_check_command(reply_to_message_id: int | None = None) -> None:
 
 
 def _precompute_bt(df_1h: pd.DataFrame, df_4h: pd.DataFrame | None = None,
-                   bb_stds: list[float] | None = None) -> dict:
+                   bb_stds: list[float] | None = None,
+                   bb_periods: list[int] | None = None) -> dict:
     close = df_1h["close"]
     high_arr = df_1h["high"]
     low_arr = df_1h["low"]
-    volume = df_1h["volume"]
 
     if bb_stds is None:
         bb_stds = [params["bb_std"]]
-    bb_cache = {s: compute_bollinger_bands(close, 20, s) for s in bb_stds}
+    if bb_periods is None:
+        bb_periods = [params["bb_period"]]
+    bb_cache = {
+        (p, s): compute_bollinger_bands(close, p, s)
+        for p in bb_periods for s in bb_stds
+    }
 
-    obv_line = obv(close, volume)
     return {
         "close": close,
         "high": high_arr,
         "low": low_arr,
-        "volume": volume,
         "rsi14": rsi(close, 14),
         "bb_cache": bb_cache,
-        "ema50": ema(close, 50),
-        "obv": obv_line,
-        "obv_ema": ema(obv_line, 20),
         "atr14": atr(high_arr, low_arr, close, 14),
-        "vol_sma20": volume.rolling(window=20).mean(),
-        "stoch_rsi": compute_stoch_rsi(close, 14, 14),
     }
 
 
@@ -602,19 +491,18 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
     close = precomp["close"]
     high_arr = precomp["high"]
     low_arr = precomp["low"]
-    volume = precomp["volume"]
     rsi14 = precomp["rsi14"]
-    bb_std_key = sim_params["bb_std"]
-    if bb_std_key not in precomp["bb_cache"]:
-        precomp["bb_cache"][bb_std_key] = compute_bollinger_bands(close, 20, bb_std_key)
-    bb_upper, bb_middle, bb_lower = precomp["bb_cache"][bb_std_key]
-    ema50 = precomp["ema50"]
-    obv_line = precomp["obv"]
-    obv_ema_v = precomp["obv_ema"]
     atr14 = precomp["atr14"]
-    vol_sma20 = precomp["vol_sma20"]
-    stoch_rsi_series = precomp["stoch_rsi"]
 
+    bb_period = sim_params["bb_period"]
+    bb_std = sim_params["bb_std"]
+    bb_key = (bb_period, bb_std)
+    if bb_key not in precomp["bb_cache"]:
+        precomp["bb_cache"][bb_key] = compute_bollinger_bands(close, bb_period, bb_std)
+    bb_upper, bb_middle, bb_lower = precomp["bb_cache"][bb_key]
+
+    rsi_oversold = sim_params["rsi_oversold"]
+    rsi_overbought = sim_params["rsi_overbought"]
     sl_mult = sim_params["sl_mult"]
     tp_mult = sim_params["tp_mult"]
     tp_hit_rr = tp_mult / sl_mult
@@ -638,7 +526,7 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
         "atr_too_low": 0,
     }
 
-    start_idx = 60
+    start_idx = max(bb_period, 14) + 1
     for i in range(start_idx, n):
         c = float(close.iloc[i])
         h = float(high_arr.iloc[i])
@@ -669,108 +557,48 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
 
             rsi_cur = float(rsi14.iloc[i])
             bb_mid_cur = float(bb_middle.iloc[i]) if pd.notna(bb_middle.iloc[i]) else float("nan")
-            obv_cur = float(obv_line.iloc[i])
-            obv_ema_cur = float(obv_ema_v.iloc[i])
 
             if d == "LONG":
-                conds = [
-                    rsi_cur > 60,
-                    pd.notna(bb_mid_cur) and c >= bb_mid_cur,
-                    obv_cur < obv_ema_cur,
-                ]
-                if sum(conds) >= 2:
-                    rr = (c - entry) / risk if risk > 0 else 0.0
-                    trades.append({"direction": d, "entry": entry, "exit": c, "rr": rr,
-                                   "result": "win" if rr > 0 else "loss"})
-                    open_pos = None
+                exit_signal = rsi_cur > rsi_overbought or (
+                    pd.notna(bb_mid_cur) and c > bb_mid_cur
+                )
             else:
-                conds = [
-                    rsi_cur < 40,
-                    pd.notna(bb_mid_cur) and c <= bb_mid_cur,
-                    obv_cur > obv_ema_cur,
-                ]
-                if sum(conds) >= 2:
+                exit_signal = rsi_cur < rsi_oversold or (
+                    pd.notna(bb_mid_cur) and c < bb_mid_cur
+                )
+            if exit_signal:
+                if d == "LONG":
+                    rr = (c - entry) / risk if risk > 0 else 0.0
+                else:
                     rr = (entry - c) / risk if risk > 0 else 0.0
-                    trades.append({"direction": d, "entry": entry, "exit": c, "rr": rr,
-                                   "result": "win" if rr > 0 else "loss"})
-                    open_pos = None
+                trades.append({"direction": d, "entry": entry, "exit": c, "rr": rr,
+                               "result": "win" if rr > 0 else "loss"})
+                open_pos = None
             continue
 
         atr_cur = float(atr14.iloc[i])
-
         if pd.isna(atr_cur):
             continue
-
         bb_upper_cur = float(bb_upper.iloc[i]) if pd.notna(bb_upper.iloc[i]) else float("nan")
         bb_lower_cur = float(bb_lower.iloc[i]) if pd.notna(bb_lower.iloc[i]) else float("nan")
-        if pd.isna(bb_upper_cur) or pd.isna(bb_lower_cur):
-            continue
-
-        ema50_cur = float(ema50.iloc[i])
-        ema50_back = float(ema50.iloc[i - 3]) if i >= 3 else float("nan")
-        if pd.isna(ema50_cur) or pd.isna(ema50_back):
-            continue
-        slope = ema50_cur - ema50_back
-
         rsi_cur = float(rsi14.iloc[i])
-        rsi_recent_low = any(
-            i - k >= 0 and pd.notna(rsi14.iloc[i - k]) and rsi14.iloc[i - k] < 30
-            for k in (0, 1, 2)
-        )
-        rsi_recent_high = any(
-            i - k >= 0 and pd.notna(rsi14.iloc[i - k]) and rsi14.iloc[i - k] > 70
-            for k in (0, 1, 2)
-        )
-
-        bb_long_touch_recent = any(
-            i - k >= 0
-            and pd.notna(low_arr.iloc[i - k]) and pd.notna(bb_lower.iloc[i - k])
-            and low_arr.iloc[i - k] <= bb_lower.iloc[i - k]
-            for k in (0, 1, 2)
-        )
-        bb_short_touch_recent = any(
-            i - k >= 0
-            and pd.notna(high_arr.iloc[i - k]) and pd.notna(bb_upper.iloc[i - k])
-            and high_arr.iloc[i - k] >= bb_upper.iloc[i - k]
-            for k in (0, 1, 2)
-        )
-        near_lower = abs(c - bb_lower_cur) <= 0.002 * c
-        near_upper = abs(c - bb_upper_cur) <= 0.002 * c
-
-        stoch_now = stoch_rsi_series.iloc[i]
-        stoch_prev = stoch_rsi_series.iloc[i - 1] if i >= 1 else float("nan")
-        if pd.isna(stoch_now) or pd.isna(stoch_prev):
+        if pd.isna(bb_upper_cur) or pd.isna(bb_lower_cur) or pd.isna(rsi_cur):
             continue
-        stoch_now = float(stoch_now)
-        stoch_prev = float(stoch_prev)
 
-        slope_flat = abs(slope) < 0.0015 * c
+        debug["candles_evaluated"] += 1
+        rsi_long = rsi_cur < rsi_oversold
+        rsi_short = rsi_cur > rsi_overbought
+        bb_long = c < bb_lower_cur
+        bb_short = c > bb_upper_cur
         atr_ok = atr_cur >= 0.003 * c
 
-        c1_long = (rsi_cur < 35) or rsi_recent_low
-        c2_long = near_lower or bb_long_touch_recent
-        c3_long = stoch_now < 20 and stoch_now > stoch_prev
-        c4_long = slope_flat
+        if rsi_long or rsi_short: debug["eval_c1"] += 1
+        if bb_long or bb_short: debug["eval_c2"] += 1
+        if atr_ok: debug["eval_c4"] += 1
+        else: debug["atr_too_low"] += 1
 
-        c1_short = (rsi_cur > 65) or rsi_recent_high
-        c2_short = near_upper or bb_short_touch_recent
-        c3_short = stoch_now > 80 and stoch_now < stoch_prev
-        c4_short = slope_flat
-
-        long_arr = [c1_long, c2_long, c3_long, c4_long]
-        short_arr = [c1_short, c2_short, c3_short, c4_short]
-        long_count = sum(long_arr)
-        short_count = sum(short_arr)
-        debug["candles_evaluated"] += 1
-        debug["conditions_met_sum"] += max(long_count, short_count)
-        if c1_long or c1_short: debug["eval_c1"] += 1
-        if c2_long or c2_short: debug["eval_c2"] += 1
-        if c3_long or c3_short: debug["eval_c3"] += 1
-        if slope_flat: debug["eval_c4"] += 1
-        if not atr_ok: debug["atr_too_low"] += 1
-
-        long_fires = atr_ok and long_count == 4 and long_count >= short_count
-        short_fires = atr_ok and (not long_fires) and short_count == 4
+        long_fires = rsi_long and bb_long
+        short_fires = rsi_short and bb_short
 
         if long_fires:
             risk = sl_mult * atr_cur
@@ -778,17 +606,13 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
                 "direction": "LONG", "entry": c,
                 "tp": c + tp_mult * atr_cur, "sl": c - sl_mult * atr_cur, "risk": risk,
             }
-            debug["fired_conditions_sum"] += long_count
-            if c1_long: debug["fired_c1"] += 1
-            if c2_long: debug["fired_c2"] += 1
-            if c3_long: debug["fired_c3"] += 1
-            if c4_long: debug["fired_c4"] += 1
+            debug["fired_c1"] += 1
+            debug["fired_c2"] += 1
+            debug["fired_conditions_sum"] += 2
             if log_entries:
                 log.info(
-                    "backtest %s LONG entry @ %.6g | rsi=%.2f stochrsi=%.1f bb_low=%.6g slope=%+.6g | "
-                    "c1=%s c2=%s c3=%s c4=%s",
-                    symbol, c, rsi_cur, stoch_now, bb_lower_cur, slope,
-                    c1_long, c2_long, c3_long, c4_long,
+                    "backtest %s LONG entry @ %.6g | rsi=%.2f bb_low=%.6g atr=%.6g",
+                    symbol, c, rsi_cur, bb_lower_cur, atr_cur,
                 )
         elif short_fires:
             risk = sl_mult * atr_cur
@@ -796,17 +620,13 @@ def _simulate_with_precomp(symbol: str, precomp: dict, sim_params: dict,
                 "direction": "SHORT", "entry": c,
                 "tp": c - tp_mult * atr_cur, "sl": c + sl_mult * atr_cur, "risk": risk,
             }
-            debug["fired_conditions_sum"] += short_count
-            if c1_short: debug["fired_c1"] += 1
-            if c2_short: debug["fired_c2"] += 1
-            if c3_short: debug["fired_c3"] += 1
-            if c4_short: debug["fired_c4"] += 1
+            debug["fired_c1"] += 1
+            debug["fired_c2"] += 1
+            debug["fired_conditions_sum"] += 2
             if log_entries:
                 log.info(
-                    "backtest %s SHORT entry @ %.6g | rsi=%.2f stochrsi=%.1f bb_up=%.6g slope=%+.6g | "
-                    "c1=%s c2=%s c3=%s c4=%s",
-                    symbol, c, rsi_cur, stoch_now, bb_upper_cur, slope,
-                    c1_short, c2_short, c3_short, c4_short,
+                    "backtest %s SHORT entry @ %.6g | rsi=%.2f bb_up=%.6g atr=%.6g",
+                    symbol, c, rsi_cur, bb_upper_cur, atr_cur,
                 )
 
     return trades, debug
@@ -816,7 +636,11 @@ def backtest_pair(symbol: str, df_1h: pd.DataFrame, df_4h: pd.DataFrame | None =
                   sim_params: dict | None = None) -> tuple[list[dict], dict]:
     if sim_params is None:
         sim_params = dict(params)
-    precomp = _precompute_bt(df_1h, df_4h, bb_stds=[sim_params["bb_std"]])
+    precomp = _precompute_bt(
+        df_1h, df_4h,
+        bb_stds=[sim_params["bb_std"]],
+        bb_periods=[sim_params["bb_period"]],
+    )
     return _simulate_with_precomp(symbol, precomp, sim_params, log_entries=True)
 
 
@@ -847,115 +671,61 @@ def _klines_to_bt_df(df: pd.DataFrame) -> pd.DataFrame:
 def _build_mean_reversion_strategy():
     from backtesting import Strategy
 
-    class MeanReversionStrategy(Strategy):
+    class BbRsiStrategy(Strategy):
+        bb_period = 20
         bb_std = 2.0
+        rsi_oversold = 30
+        rsi_overbought = 70
         sl_mult = 1.0
-        tp_mult = 1.5
+        tp_mult = 2.0
 
         def init(self):
             close = pd.Series(self.data.Close)
             high = pd.Series(self.data.High)
             low = pd.Series(self.data.Low)
-            volume = pd.Series(self.data.Volume)
 
             self.rsi14 = self.I(lambda: rsi(close, 14).values, name="RSI14")
-            bb_u, bb_m, bb_l = compute_bollinger_bands(close, 20, self.bb_std)
+            bb_u, bb_m, bb_l = compute_bollinger_bands(close, self.bb_period, self.bb_std)
             self.bb_upper = self.I(lambda: bb_u.values, name="BB_upper")
             self.bb_middle = self.I(lambda: bb_m.values, name="BB_middle")
             self.bb_lower = self.I(lambda: bb_l.values, name="BB_lower")
-            self.ema50_arr = self.I(lambda: ema(close, 50).values, name="EMA50")
             self.atr14 = self.I(lambda: atr(high, low, close, 14).values, name="ATR14")
-            self.stoch_rsi = self.I(
-                lambda: compute_stoch_rsi(close, 14, 14).values, name="StochRSI"
-            )
-            obv_line = obv(close, volume)
-            self.obv_arr = self.I(lambda: obv_line.values, name="OBV")
-            self.obv_ema_arr = self.I(lambda: ema(obv_line, 20).values, name="OBV_EMA")
 
         def next(self):
             n = len(self.data.Close)
-            if n < 60:
+            if n < max(self.bb_period, 14) + 1:
                 return
 
             price = float(self.data.Close[-1])
-            atr_val = float(self.atr14[-1])
-            if np.isnan(atr_val):
-                return
-
-            if self.position:
-                rsi_now = float(self.rsi14[-1])
-                bb_mid = float(self.bb_middle[-1])
-                obv_n = float(self.obv_arr[-1])
-                obv_e = float(self.obv_ema_arr[-1])
-
-                if self.position.is_long:
-                    conds = [rsi_now > 60, price >= bb_mid, obv_n < obv_e]
-                    if sum(bool(c) for c in conds) >= 2:
-                        self.position.close()
-                else:
-                    conds = [rsi_now < 40, price <= bb_mid, obv_n > obv_e]
-                    if sum(bool(c) for c in conds) >= 2:
-                        self.position.close()
-                return
-
-            if atr_val < 0.003 * price:
-                return
-
             rsi_now = float(self.rsi14[-1])
             bb_lower_now = float(self.bb_lower[-1])
             bb_upper_now = float(self.bb_upper[-1])
-            ema50_now = float(self.ema50_arr[-1])
-            ema50_back = float(self.ema50_arr[-4]) if n >= 4 else float("nan")
-            stoch_now = float(self.stoch_rsi[-1])
-            stoch_prev = float(self.stoch_rsi[-2]) if n >= 2 else float("nan")
+            bb_middle_now = float(self.bb_middle[-1])
+            atr_val = float(self.atr14[-1])
+
             if any(np.isnan(x) for x in (rsi_now, bb_lower_now, bb_upper_now,
-                                          ema50_now, ema50_back, stoch_now, stoch_prev)):
+                                          bb_middle_now, atr_val)):
                 return
 
-            slope = ema50_now - ema50_back
-            slope_flat = abs(slope) < 0.0015 * price
+            if self.position:
+                if self.position.is_long:
+                    if rsi_now > self.rsi_overbought or price > bb_middle_now:
+                        self.position.close()
+                else:
+                    if rsi_now < self.rsi_oversold or price < bb_middle_now:
+                        self.position.close()
+                return
 
-            rsi_recent_low = any(
-                n >= k and not np.isnan(self.rsi14[-k]) and float(self.rsi14[-k]) < 30
-                for k in (1, 2, 3)
-            )
-            rsi_recent_high = any(
-                n >= k and not np.isnan(self.rsi14[-k]) and float(self.rsi14[-k]) > 70
-                for k in (1, 2, 3)
-            )
-            bb_long_touch = any(
-                n >= k and not np.isnan(self.bb_lower[-k])
-                and float(self.data.Low[-k]) <= float(self.bb_lower[-k])
-                for k in (1, 2, 3)
-            )
-            bb_short_touch = any(
-                n >= k and not np.isnan(self.bb_upper[-k])
-                and float(self.data.High[-k]) >= float(self.bb_upper[-k])
-                for k in (1, 2, 3)
-            )
-            near_lower = abs(price - bb_lower_now) <= 0.002 * price
-            near_upper = abs(price - bb_upper_now) <= 0.002 * price
-
-            c1_long = (rsi_now < 35) or rsi_recent_low
-            c2_long = bb_long_touch or near_lower
-            c3_long = stoch_now < 20 and stoch_now > stoch_prev
-            c4_long = slope_flat
-
-            c1_short = (rsi_now > 65) or rsi_recent_high
-            c2_short = bb_short_touch or near_upper
-            c3_short = stoch_now > 80 and stoch_now < stoch_prev
-            c4_short = slope_flat
-
-            if c1_long and c2_long and c3_long and c4_long:
+            if rsi_now < self.rsi_oversold and price < bb_lower_now:
                 tp = price + self.tp_mult * atr_val
                 sl = price - self.sl_mult * atr_val
                 self.buy(sl=sl, tp=tp)
-            elif c1_short and c2_short and c3_short and c4_short:
+            elif rsi_now > self.rsi_overbought and price > bb_upper_now:
                 tp = price - self.tp_mult * atr_val
                 sl = price + self.sl_mult * atr_val
                 self.sell(sl=sl, tp=tp)
 
-    return MeanReversionStrategy
+    return BbRsiStrategy
 
 
 def _run_pair_library_backtest(symbol: str) -> dict | None:
@@ -973,7 +743,10 @@ def _run_pair_library_backtest(symbol: str) -> dict | None:
         cash=10000, commission=0.001, exclusive_orders=True,
     )
     stats = bt.run(
+        bb_period=params["bb_period"],
         bb_std=params["bb_std"],
+        rsi_oversold=params["rsi_oversold"],
+        rsi_overbought=params["rsi_overbought"],
         sl_mult=params["sl_mult"],
         tp_mult=params["tp_mult"],
     )
@@ -1128,6 +901,7 @@ def _run_optimize(reply_to_message_id: int | None) -> None:
         opt_dates: list = []
         val_dates: list = []
 
+        bb_period_grid = [15, 20, 25]
         bb_std_grid = [1.5, 2.0, 2.5]
         for symbol in PAIRS:
             try:
@@ -1141,8 +915,12 @@ def _run_optimize(reply_to_message_id: int | None) -> None:
                 if len(df_1h_val) < 200:
                     log.warning("optimize %s: validation window too short", symbol)
                     continue
-                opt_precomp[symbol] = _precompute_bt(df_1h_opt, bb_stds=bb_std_grid)
-                val_precomp[symbol] = _precompute_bt(df_1h_val, bb_stds=bb_std_grid)
+                opt_precomp[symbol] = _precompute_bt(
+                    df_1h_opt, bb_stds=bb_std_grid, bb_periods=bb_period_grid
+                )
+                val_precomp[symbol] = _precompute_bt(
+                    df_1h_val, bb_stds=bb_std_grid, bb_periods=bb_period_grid
+                )
                 opt_dates.append((df_1h_opt["close_time"].iloc[0],
                                   df_1h_opt["close_time"].iloc[-1]))
                 val_dates.append((df_1h_val["close_time"].iloc[0],
@@ -1160,22 +938,21 @@ def _run_optimize(reply_to_message_id: int | None) -> None:
         val_start = min(d[0] for d in val_dates)
         val_end = max(d[1] for d in val_dates)
 
-        rsi_oversold_grid = [20, 25, 30]
-        rsi_overbought_grid = [70, 75, 80]
-        vol_grid = [1.0, 1.1, 1.2]
-        sl_grid = [0.75, 1.0, 1.25]
-        tp_grid = [1.0, 1.5, 2.0]
+        rsi_oversold_grid = [25, 30, 35]
+        rsi_overbought_grid = [65, 70, 75]
+        sl_grid = [0.75, 1.0, 1.5]
+        tp_grid = [1.5, 2.0, 2.5]
 
         combos = []
-        for ro, rb, bb_s, v, sm, tm in itertools.product(
-            rsi_oversold_grid, rsi_overbought_grid, bb_std_grid,
-            vol_grid, sl_grid, tp_grid,
+        for ro, rb, bp, bs, sm, tm in itertools.product(
+            rsi_oversold_grid, rsi_overbought_grid,
+            bb_period_grid, bb_std_grid, sl_grid, tp_grid,
         ):
             combos.append({
                 "rsi_oversold": ro,
                 "rsi_overbought": rb,
-                "bb_std": bb_s,
-                "volume_mult": v,
+                "bb_period": bp,
+                "bb_std": bs,
                 "sl_mult": sm,
                 "tp_mult": tm,
             })
@@ -1247,8 +1024,7 @@ def _run_optimize(reply_to_message_id: int | None) -> None:
         def fmt_combo(p: dict) -> str:
             return (
                 f"rsi{p['rsi_oversold']:>2}/{p['rsi_overbought']:>2} "
-                f"bb{p['bb_std']:.1f} "
-                f"vol{p['volume_mult']:.2f} "
+                f"bb({p['bb_period']:>2},{p['bb_std']:.1f}) "
                 f"sl{p['sl_mult']:.2f} "
                 f"tp{p['tp_mult']:.2f}"
             )
@@ -1411,9 +1187,10 @@ def main() -> None:
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
         f"Watching {len(PAIRS)} pairs on {TIMEFRAME}.\n"
-        "Strategy: Mean reversion using RSI extremes and Bollinger Band touches "
-        "(OBV + volume + EMA50 slope confirmation).\n"
-        "Targeting high win rate at 1.5:1 reward:risk.\n"
+        "Strategy: BbRsi (proven Freqtrade community mean reversion). "
+        f"LONG = RSI < {params['rsi_oversold']} AND close < lower BB. "
+        f"SHORT = RSI > {params['rsi_overbought']} AND close > upper BB.\n"
+        "TP at 2x ATR, SL at 1x ATR (2:1 reward:risk).\n"
         f"Live params: {params_text()}\n"
         f"{win_rate_text()}\n"
         f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
