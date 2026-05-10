@@ -3466,15 +3466,47 @@ def handle_win_command(reply_to_message_id: int | None = None) -> None:
     n_open = len(open_positions)
     n_total = n_closed + n_open
 
-    winners = [t for t in closed_trades if float(t.get("r", 0)) > 0]
-    losers = [t for t in closed_trades if float(t.get("r", 0)) <= 0]
+    def _is_win(t: dict) -> bool:
+        # Prefer explicit win field if present
+        if "win" in t:
+            return bool(t["win"])
+        # Fall back to direction + price comparison (handles legacy records
+        # where sl_distance / r weren't tracked at the time of close)
+        direction = t.get("direction", "")
+        try:
+            entry = float(t.get("entry_price", 0))
+            exit_p = float(t.get("exit_price", 0))
+        except (TypeError, ValueError):
+            return False
+        if direction == "LONG":
+            return exit_p > entry
+        if direction == "SHORT":
+            return exit_p < entry
+        # Last resort
+        return float(t.get("r", 0)) > 0
+
+    winners = [t for t in closed_trades if _is_win(t)]
+    losers = [t for t in closed_trades if not _is_win(t)]
     n_win = len(winners)
     n_loss = len(losers)
     win_rate = (100.0 * n_win / n_closed) if n_closed else 0.0
 
-    avg_winner = (sum(float(t["r"]) for t in winners) / n_win) if n_win else 0.0
-    avg_loser = (sum(float(t["r"]) for t in losers) / n_loss) if n_loss else 0.0
-    expectancy = sum(float(t["r"]) for t in closed_trades) / n_closed
+    # Only include trades with non-zero R in averages and best/worst
+    rated = [t for t in closed_trades if float(t.get("r", 0)) != 0]
+    rated_winners = [t for t in rated if _is_win(t)]
+    rated_losers = [t for t in rated if not _is_win(t)]
+    avg_winner = (
+        sum(float(t["r"]) for t in rated_winners) / len(rated_winners)
+        if rated_winners else 0.0
+    )
+    avg_loser = (
+        sum(float(t["r"]) for t in rated_losers) / len(rated_losers)
+        if rated_losers else 0.0
+    )
+    expectancy = (
+        sum(float(t["r"]) for t in rated) / len(rated)
+        if rated else 0.0
+    )
 
     def _fmt_date(s: str) -> str:
         if not s:
@@ -3492,14 +3524,30 @@ def handle_win_command(reply_to_message_id: int | None = None) -> None:
     first_date = min(times) if times else ""
     today = datetime.now(MYT).strftime("%Y-%m-%d")
 
-    best = max(closed_trades, key=lambda t: float(t.get("r", 0)))
-    worst = min(closed_trades, key=lambda t: float(t.get("r", 0)))
+    if rated:
+        best = max(rated, key=lambda t: float(t.get("r", 0)))
+        worst = min(rated, key=lambda t: float(t.get("r", 0)))
+    else:
+        best = worst = None
 
     active = STRATEGIES_BY_ID.get(active_strategy_id) if active_strategy_id else None
     strat_name = active.name if active else "(unknown)"
     backtest_wr = float(getattr(active, "backtest_wr", 61.3)) if active else 61.3
     diff = win_rate - backtest_wr
     diff_str = f"{diff:+.1f} pp"
+
+    if best is not None and worst is not None:
+        best_line = (
+            f"Best trade:  {best['symbol']} {float(best['r']):+.2f} R "
+            f"({_fmt_date(best.get('exit_time', ''))})"
+        )
+        worst_line = (
+            f"Worst trade: {worst['symbol']} {float(worst['r']):+.2f} R "
+            f"({_fmt_date(worst.get('exit_time', ''))})"
+        )
+    else:
+        best_line = "Best trade:  (no rated trades yet — pre-deploy closes lack ATR)"
+        worst_line = "Worst trade: (no rated trades yet)"
 
     body = (
         "━━━━━━━━━━━━━━━━━━━\n"
@@ -3517,10 +3565,8 @@ def handle_win_command(reply_to_message_id: int | None = None) -> None:
         "\n"
         f"Still open:             {n_open} positions\n"
         "\n"
-        f"Best trade:  {best['symbol']} {float(best['r']):+.2f} R "
-        f"({_fmt_date(best.get('exit_time', ''))})\n"
-        f"Worst trade: {worst['symbol']} {float(worst['r']):+.2f} R "
-        f"({_fmt_date(worst.get('exit_time', ''))})\n"
+        f"{best_line}\n"
+        f"{worst_line}\n"
         "━━━━━━━━━━━━━━━━━━━\n"
         f"Backtest WR: {backtest_wr:.1f}% (n=6274)\n"
         f"Live vs Backtest: {diff_str}"
@@ -4164,7 +4210,8 @@ def scan_once() -> None:
                     exit_price = float(result["price"])
                     exit_time = str(result.get("candle_time", ""))
                     if entry is not None:
-                        trade_results.append(exit_price > entry)
+                        win_bool = exit_price > entry
+                        trade_results.append(win_bool)
                         sl_dist = float(meta.get("sl_distance", 0.0))
                         r_mult = ((exit_price - entry) / sl_dist) if sl_dist > 0 else 0.0
                         closed_trades.append({
@@ -4173,6 +4220,7 @@ def scan_once() -> None:
                             "entry_time": meta.get("entry_time", ""),
                             "exit_time": exit_time,
                             "sl_distance": sl_dist, "r": r_mult,
+                            "win": win_bool,
                             "exit_reason": "; ".join(reasons),
                         })
                     open_positions.pop(symbol, None)
@@ -4187,7 +4235,8 @@ def scan_once() -> None:
                     exit_price = float(result["price"])
                     exit_time = str(result.get("candle_time", ""))
                     if entry is not None:
-                        trade_results.append(exit_price < entry)
+                        win_bool = exit_price < entry
+                        trade_results.append(win_bool)
                         sl_dist = float(meta.get("sl_distance", 0.0))
                         r_mult = ((entry - exit_price) / sl_dist) if sl_dist > 0 else 0.0
                         closed_trades.append({
@@ -4196,6 +4245,7 @@ def scan_once() -> None:
                             "entry_time": meta.get("entry_time", ""),
                             "exit_time": exit_time,
                             "sl_distance": sl_dist, "r": r_mult,
+                            "win": win_bool,
                             "exit_reason": "; ".join(reasons),
                         })
                     open_positions.pop(symbol, None)
