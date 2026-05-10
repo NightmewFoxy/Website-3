@@ -41,6 +41,13 @@ trade_results: list[bool] = []
 closed_trades: list[dict] = []
 position_entry_meta: dict[str, dict] = {}
 
+# User-acceptance tracking (additive — independent of trade_results/closed_trades)
+active_signals: dict[str, dict] = {}
+accepted_completed: list[dict] = []
+total_signals_sent_count: int = 0
+total_skipped_count: int = 0
+SIGNAL_TIMEOUT_SECONDS = 4 * 3600
+
 STATE_PATH = os.environ.get(
     "STATE_PATH",
     "/data/state.json" if os.path.isdir("/data") else "state.json",
@@ -101,6 +108,7 @@ def params_text() -> str:
 
 
 def load_state() -> None:
+    global total_signals_sent_count, total_skipped_count
     if not os.path.exists(STATE_PATH):
         log.info("No prior state at %s; starting fresh", STATE_PATH)
         return
@@ -113,9 +121,15 @@ def load_state() -> None:
         last_signal_by_pair.update(data.get("last_signal_by_pair", {}))
         closed_trades[:] = list(data.get("closed_trades", []))
         position_entry_meta.update(data.get("position_entry_meta", {}))
+        active_signals.update(data.get("active_signals", {}))
+        accepted_completed[:] = list(data.get("accepted_completed", []))
+        total_signals_sent_count = int(data.get("total_signals_sent_count", 0))
+        total_skipped_count = int(data.get("total_skipped_count", 0))
         log.info(
-            "Loaded state: %d closed trades (rich), %d closed (legacy), %d open",
-            len(closed_trades), len(trade_results), len(open_positions),
+            "Loaded state: %d closed (rich), %d open, %d active signals, "
+            "%d accepted completed, sent=%d skipped=%d",
+            len(closed_trades), len(open_positions), len(active_signals),
+            len(accepted_completed), total_signals_sent_count, total_skipped_count,
         )
     except Exception as e:
         log.warning("Failed to load state from %s: %s", STATE_PATH, e)
@@ -135,6 +149,10 @@ def save_state() -> None:
                 "last_signal_by_pair": last_signal_by_pair,
                 "closed_trades": closed_trades,
                 "position_entry_meta": position_entry_meta,
+                "active_signals": active_signals,
+                "accepted_completed": accepted_completed,
+                "total_signals_sent_count": total_signals_sent_count,
+                "total_skipped_count": total_skipped_count,
             }, f, default=str)
         os.replace(tmp, STATE_PATH)
     except Exception as e:
@@ -168,6 +186,70 @@ def send_telegram(text: str, reply_to_message_id: int | None = None) -> None:
             log.error("Telegram send failed: %s %s", r.status_code, r.text)
     except requests.RequestException as e:
         log.error("Telegram request error: %s", e)
+
+
+def send_telegram_with_buttons(text: str, signal_id: str) -> int | None:
+    """Send a message with Accept/Skip inline buttons. Returns message_id or None."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram credentials missing; skipping send")
+        return None
+    url = f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ I'm In", "callback_data": f"accept_{signal_id}"},
+            {"text": "❌ Skip", "callback_data": f"skip_{signal_id}"},
+        ]]
+    }
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": keyboard,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            log.error("Telegram send failed: %s %s", r.status_code, r.text)
+            return None
+        data = r.json()
+        if data.get("ok"):
+            return data["result"].get("message_id")
+    except requests.RequestException as e:
+        log.error("Telegram request error: %s", e)
+    return None
+
+
+def edit_telegram_message(message_id: int, text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not message_id:
+        return
+    url = f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            log.warning("Telegram edit failed: %s %s", r.status_code, r.text)
+    except requests.RequestException as e:
+        log.warning("Telegram edit error: %s", e)
+
+
+def answer_callback_query(query_id: str, text: str = "") -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    payload: dict = {"callback_query_id": query_id}
+    if text:
+        payload["text"] = text
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except requests.RequestException as e:
+        log.warning("Telegram answerCallback error: %s", e)
 
 
 def fetch_klines(symbol: str, interval: str = TIMEFRAME, limit: int = KLINE_LIMIT,
@@ -3452,26 +3534,95 @@ def score_pair(df: pd.DataFrame, symbol: str) -> tuple[str, int]:
     return "SHORT", short_score
 
 
+def _handle_signal_callback(cb: dict, target_chat: str) -> None:
+    cb_id = cb.get("id", "")
+    data = cb.get("data", "") or ""
+    msg_obj = cb.get("message") or {}
+    from_chat = str(msg_obj.get("chat", {}).get("id", ""))
+    if from_chat != target_chat:
+        answer_callback_query(cb_id, "Unauthorized")
+        return
+    if "_" not in data:
+        answer_callback_query(cb_id, "Bad data")
+        return
+    action, _, sid = data.partition("_")
+    if sid not in active_signals:
+        answer_callback_query(cb_id, "Signal expired or unknown")
+        return
+    sig = active_signals[sid]
+    cur_status = sig.get("status", "")
+    if cur_status != "pending":
+        answer_callback_query(cb_id, f"Already {cur_status}")
+        return
+    msg_id = sig.get("message_id")
+    original = sig.get("original_text", "")
+    global total_skipped_count
+    if action == "accept":
+        sig["status"] = "accepted"
+        save_state()
+        if msg_id:
+            edit_telegram_message(msg_id, original + "\n\n<b>✅ Accepted</b>")
+        answer_callback_query(cb_id, "Trade accepted")
+        log.info("signal accepted: %s", sid)
+    elif action == "skip":
+        sig["status"] = "skipped"
+        total_skipped_count += 1
+        save_state()
+        if msg_id:
+            edit_telegram_message(msg_id, original + "\n\n<b>❌ Skipped</b>")
+        answer_callback_query(cb_id, "Trade skipped")
+        log.info("signal skipped: %s", sid)
+    else:
+        answer_callback_query(cb_id, "Unknown action")
+
+
+def _expire_old_signals() -> None:
+    global total_skipped_count
+    now = int(time.time())
+    expired_ids = []
+    for sid, sig in list(active_signals.items()):
+        if sig.get("status") != "pending":
+            continue
+        if now - int(sig.get("sent_at", now)) > SIGNAL_TIMEOUT_SECONDS:
+            expired_ids.append(sid)
+    if not expired_ids:
+        return
+    for sid in expired_ids:
+        sig = active_signals[sid]
+        sig["status"] = "skipped"
+        sig["expired"] = True
+        total_skipped_count += 1
+        msg_id = sig.get("message_id")
+        if msg_id:
+            edit_telegram_message(
+                msg_id,
+                sig.get("original_text", "") + "\n\n<b>⌛ Expired (4h timeout)</b>",
+            )
+    save_state()
+    log.info("Expired %d pending signals", len(expired_ids))
+
+
+def handle_reset_command(reply_to_message_id: int | None = None) -> None:
+    global total_signals_sent_count, total_skipped_count
+    log.info("Processing /reset command")
+    closed_trades.clear()
+    accepted_completed.clear()
+    trade_results[:] = []
+    total_signals_sent_count = 0
+    total_skipped_count = 0
+    save_state()
+    send_telegram(
+        "✅ Win rate and trade history reset. Tracking fresh from now.",
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
 def handle_win_command(reply_to_message_id: int | None = None) -> None:
     log.info("Processing /win command")
-    if not closed_trades:
-        send_telegram(
-            "No completed trades yet. The bot needs to both open and close a "
-            "position for it to count. Check back after your first closed signal.",
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-
-    n_closed = len(closed_trades)
-    n_open = len(open_positions)
-    n_total = n_closed + n_open
 
     def _is_win(t: dict) -> bool:
-        # Prefer explicit win field if present
         if "win" in t:
             return bool(t["win"])
-        # Fall back to direction + price comparison (handles legacy records
-        # where sl_distance / r weren't tracked at the time of close)
         direction = t.get("direction", "")
         try:
             entry = float(t.get("entry_price", 0))
@@ -3482,31 +3633,7 @@ def handle_win_command(reply_to_message_id: int | None = None) -> None:
             return exit_p > entry
         if direction == "SHORT":
             return exit_p < entry
-        # Last resort
         return float(t.get("r", 0)) > 0
-
-    winners = [t for t in closed_trades if _is_win(t)]
-    losers = [t for t in closed_trades if not _is_win(t)]
-    n_win = len(winners)
-    n_loss = len(losers)
-    win_rate = (100.0 * n_win / n_closed) if n_closed else 0.0
-
-    # Only include trades with non-zero R in averages and best/worst
-    rated = [t for t in closed_trades if float(t.get("r", 0)) != 0]
-    rated_winners = [t for t in rated if _is_win(t)]
-    rated_losers = [t for t in rated if not _is_win(t)]
-    avg_winner = (
-        sum(float(t["r"]) for t in rated_winners) / len(rated_winners)
-        if rated_winners else 0.0
-    )
-    avg_loser = (
-        sum(float(t["r"]) for t in rated_losers) / len(rated_losers)
-        if rated_losers else 0.0
-    )
-    expectancy = (
-        sum(float(t["r"]) for t in rated) / len(rated)
-        if rated else 0.0
-    )
 
     def _fmt_date(s: str) -> str:
         if not s:
@@ -3516,60 +3643,122 @@ def handle_win_command(reply_to_message_id: int | None = None) -> None:
         except Exception:
             return str(s)
 
-    times = [t.get("entry_time", "") for t in closed_trades if t.get("entry_time")]
+    # Section 1 — Accepted trades performance
+    n_acc_closed = len(accepted_completed)
+    acc_winners = [t for t in accepted_completed if _is_win(t)]
+    acc_losers = [t for t in accepted_completed if not _is_win(t)]
+    n_acc_win = len(acc_winners)
+    n_acc_loss = len(acc_losers)
+    acc_win_rate = (100.0 * n_acc_win / n_acc_closed) if n_acc_closed else 0.0
+    acc_rated = [t for t in accepted_completed if float(t.get("r", 0)) != 0]
+    acc_rated_winners = [t for t in acc_rated if _is_win(t)]
+    acc_rated_losers = [t for t in acc_rated if not _is_win(t)]
+    acc_avg_winner = (
+        sum(float(t["r"]) for t in acc_rated_winners) / len(acc_rated_winners)
+        if acc_rated_winners else 0.0
+    )
+    acc_avg_loser = (
+        sum(float(t["r"]) for t in acc_rated_losers) / len(acc_rated_losers)
+        if acc_rated_losers else 0.0
+    )
+    acc_expectancy = (
+        sum(float(t["r"]) for t in acc_rated) / len(acc_rated)
+        if acc_rated else 0.0
+    )
+    if acc_rated:
+        acc_best = max(acc_rated, key=lambda t: float(t.get("r", 0)))
+        acc_worst = min(acc_rated, key=lambda t: float(t.get("r", 0)))
+    else:
+        acc_best = acc_worst = None
+
+    # Section 2 — All signals counters
+    n_sent = total_signals_sent_count
+    # Accepted = anything that got status accepted: those still open (status accepted in
+    # active_signals) plus those now in accepted_completed
+    n_accepted_open = sum(
+        1 for s in active_signals.values() if s.get("status") == "accepted"
+    )
+    n_accepted_total = n_acc_closed + n_accepted_open
+    n_skipped = total_skipped_count
+    n_pending = sum(
+        1 for s in active_signals.values() if s.get("status") == "pending"
+    )
+    accept_rate = (100.0 * n_accepted_total / n_sent) if n_sent else 0.0
+
+    # Date range from earliest signal seen
+    times = [s.get("entry_time", "") for s in accepted_completed if s.get("entry_time")]
     times.extend(
-        m.get("entry_time", "") for m in position_entry_meta.values()
-        if m.get("entry_time")
+        s.get("entry_time", "") for s in active_signals.values() if s.get("entry_time")
     )
     first_date = min(times) if times else ""
     today = datetime.now(MYT).strftime("%Y-%m-%d")
 
-    if rated:
-        best = max(rated, key=lambda t: float(t.get("r", 0)))
-        worst = min(rated, key=lambda t: float(t.get("r", 0)))
-    else:
-        best = worst = None
-
     active = STRATEGIES_BY_ID.get(active_strategy_id) if active_strategy_id else None
     strat_name = active.name if active else "(unknown)"
     backtest_wr = float(getattr(active, "backtest_wr", 61.3)) if active else 61.3
-    diff = win_rate - backtest_wr
-    diff_str = f"{diff:+.1f} pp"
 
-    if best is not None and worst is not None:
+    # Build the accepted-trades section
+    if n_acc_closed == 0 and n_accepted_open == 0 and n_sent == 0:
+        send_telegram(
+            "No signals tracked yet. Once the bot fires a signal and you tap "
+            "✅ I'm In or ❌ Skip, your live stats will start populating.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    if acc_best is not None and acc_worst is not None:
         best_line = (
-            f"Best trade:  {best['symbol']} {float(best['r']):+.2f} R "
-            f"({_fmt_date(best.get('exit_time', ''))})"
+            f"Best:        {acc_best['symbol']} {float(acc_best['r']):+.2f} R "
+            f"({_fmt_date(acc_best.get('exit_time', ''))})"
         )
         worst_line = (
-            f"Worst trade: {worst['symbol']} {float(worst['r']):+.2f} R "
-            f"({_fmt_date(worst.get('exit_time', ''))})"
+            f"Worst:       {acc_worst['symbol']} {float(acc_worst['r']):+.2f} R "
+            f"({_fmt_date(acc_worst.get('exit_time', ''))})"
         )
     else:
-        best_line = "Best trade:  (no rated trades yet — pre-deploy closes lack ATR)"
-        worst_line = "Worst trade: (no rated trades yet)"
+        best_line = "Best:        (no rated accepted trades yet)"
+        worst_line = "Worst:       (no rated accepted trades yet)"
+
+    section1 = (
+        "Section 1: Accepted Trades\n"
+        "─────────────────────\n"
+        f"Total accepted:        {n_accepted_total}\n"
+        f" ├ Closed:             {n_acc_closed}\n"
+        f" └ Still open:         {n_accepted_open}\n"
+        f"Wins:                  {n_acc_win}\n"
+        f"Losses:                {n_acc_loss}\n"
+        f"Win Rate:              {acc_win_rate:.1f}%\n"
+        f"Avg winner:           {acc_avg_winner:+.2f} R\n"
+        f"Avg loser:            {acc_avg_loser:+.2f} R\n"
+        f"Expectancy:           {acc_expectancy:+.2f} R\n"
+        f"{best_line}\n"
+        f"{worst_line}\n"
+    )
+
+    section2 = (
+        "Section 2: All Signals Sent\n"
+        "─────────────────────\n"
+        f"Total signals sent:    {n_sent}\n"
+        f"Accepted:              {n_accepted_total}\n"
+        f"Skipped:               {n_skipped}\n"
+        f"Pending response:      {n_pending}\n"
+        f"Acceptance rate:       {accept_rate:.1f}%\n"
+    )
+
+    diff = acc_win_rate - backtest_wr
+    cmp_line = (
+        f"Backtest WR: {backtest_wr:.1f}% | "
+        f"Your accepted trades WR: {acc_win_rate:.1f}% "
+        f"({diff:+.1f} pp)"
+    )
 
     body = (
         "━━━━━━━━━━━━━━━━━━━\n"
-        f"From: {_fmt_date(first_date)} to {today}\n"
-        "\n"
-        f"Total signals sent:     {n_total}\n"
-        f"Positions closed:       {n_closed}\n"
-        f" ├ Winners:             {n_win}\n"
-        f" ├ Losers:              {n_loss}\n"
-        f" └ Win Rate:            {win_rate:.1f}%\n"
-        "\n"
-        f"Avg winner:            {avg_winner:+.2f} R\n"
-        f"Avg loser:             {avg_loser:+.2f} R\n"
-        f"Expectancy:            {expectancy:+.2f} R\n"
-        "\n"
-        f"Still open:             {n_open} positions\n"
-        "\n"
-        f"{best_line}\n"
-        f"{worst_line}\n"
+        f"From: {_fmt_date(first_date)} to {today}\n\n"
+        f"{section1}\n"
+        f"{section2}\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        f"Backtest WR: {backtest_wr:.1f}% (n=6274)\n"
-        f"Live vs Backtest: {diff_str}"
+        f"{cmp_line}"
     )
     msg = (
         f"\U0001F4CA <b>Live Performance — {strat_name}</b>\n"
@@ -4159,6 +4348,13 @@ def telegram_poll_loop() -> None:
                 continue
             for upd in r.json().get("result", []):
                 offset = upd["update_id"] + 1
+                cb = upd.get("callback_query")
+                if cb:
+                    try:
+                        _handle_signal_callback(cb, target_chat)
+                    except Exception as e:
+                        log.exception("callback handler failed: %s", e)
+                    continue
                 msg = upd.get("message")
                 if not msg:
                     continue
@@ -4181,6 +4377,12 @@ def telegram_poll_loop() -> None:
                     handle_discover2_command(msg.get("message_id"))
                 elif cmd == "/win":
                     handle_win_command(msg.get("message_id"))
+                elif cmd == "/reset":
+                    handle_reset_command(msg.get("message_id"))
+            try:
+                _expire_old_signals()
+            except Exception as e:
+                log.warning("expire sweep failed: %s", e)
         except Exception as e:
             log.warning("Telegram poll error: %s", e)
             time.sleep(5)
@@ -4223,6 +4425,21 @@ def scan_once() -> None:
                             "win": win_bool,
                             "exit_reason": "; ".join(reasons),
                         })
+                        # Accepted-trade tracking (additive, separate from above)
+                        sid = meta.get("signal_id")
+                        if sid and sid in active_signals:
+                            sig = active_signals.pop(sid)
+                            if sig.get("status") == "accepted":
+                                accepted_completed.append({
+                                    "symbol": symbol, "direction": "LONG",
+                                    "entry_price": float(entry),
+                                    "exit_price": exit_price,
+                                    "entry_time": sig.get("entry_time", ""),
+                                    "exit_time": exit_time,
+                                    "sl_distance": sl_dist, "r": r_mult,
+                                    "win": win_bool,
+                                    "exit_reason": "; ".join(reasons),
+                                })
                     open_positions.pop(symbol, None)
                     save_state()
                     log.info("%s: CLOSE LONG sent (%s)", symbol, "; ".join(reasons))
@@ -4248,6 +4465,20 @@ def scan_once() -> None:
                             "win": win_bool,
                             "exit_reason": "; ".join(reasons),
                         })
+                        sid = meta.get("signal_id")
+                        if sid and sid in active_signals:
+                            sig = active_signals.pop(sid)
+                            if sig.get("status") == "accepted":
+                                accepted_completed.append({
+                                    "symbol": symbol, "direction": "SHORT",
+                                    "entry_price": float(entry),
+                                    "exit_price": exit_price,
+                                    "entry_time": sig.get("entry_time", ""),
+                                    "exit_time": exit_time,
+                                    "sl_distance": sl_dist, "r": r_mult,
+                                    "win": win_bool,
+                                    "exit_reason": "; ".join(reasons),
+                                })
                     open_positions.pop(symbol, None)
                     save_state()
                     log.info("%s: CLOSE SHORT sent (%s)", symbol, "; ".join(reasons))
@@ -4263,16 +4494,38 @@ def scan_once() -> None:
             position_entry_price[symbol] = result["price"]
             atr_at_entry = float(result.get("atr", 0.0) or 0.0)
             sl_mult_v = float(params.get("sl_mult", 1.0) or 1.0)
+            sent_at_ts = int(time.time())
+            signal_id = f"{symbol}_{direction}_{int(time.time() * 1000)}"
             position_entry_meta[symbol] = {
                 "entry_time": str(result.get("candle_time", "")),
                 "atr": atr_at_entry,
                 "sl_mult": sl_mult_v,
                 "sl_distance": atr_at_entry * sl_mult_v,
+                "signal_id": signal_id,
             }
-            save_state()
             msg = format_message(symbol, result)
-            send_telegram(msg)
-            log.info("%s: %s signal sent", symbol, direction)
+            active_signals[signal_id] = {
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "direction": direction,
+                "entry_price": float(result["price"]),
+                "entry_time": str(result.get("candle_time", "")),
+                "atr_at_entry": atr_at_entry,
+                "sl_distance": atr_at_entry * sl_mult_v,
+                "sent_at": sent_at_ts,
+                "status": "pending",
+                "original_text": msg,
+                "message_id": None,
+            }
+            global total_signals_sent_count
+            total_signals_sent_count += 1
+            save_state()
+            message_id = send_telegram_with_buttons(msg, signal_id)
+            if message_id is not None:
+                active_signals[signal_id]["message_id"] = message_id
+                save_state()
+            log.info("%s: %s signal sent (sid=%s, msg=%s)",
+                     symbol, direction, signal_id, message_id)
         except requests.RequestException as e:
             log.error("%s: network error: %s", symbol, e)
         except Exception as e:
