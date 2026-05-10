@@ -48,6 +48,10 @@ total_signals_sent_count: int = 0
 total_skipped_count: int = 0
 SIGNAL_TIMEOUT_SECONDS = 4 * 3600
 
+# Operational state for /ping and daily summary scheduling
+last_scan_time: int = 0  # unix seconds; updated when scan_once starts
+last_daily_summary_date: str = ""  # YYYY-MM-DD in MYT
+
 STATE_PATH = os.environ.get(
     "STATE_PATH",
     "/data/state.json" if os.path.isdir("/data") else "state.json",
@@ -108,7 +112,7 @@ def params_text() -> str:
 
 
 def load_state() -> None:
-    global total_signals_sent_count, total_skipped_count
+    global total_signals_sent_count, total_skipped_count, last_daily_summary_date
     if not os.path.exists(STATE_PATH):
         log.info("No prior state at %s; starting fresh", STATE_PATH)
         return
@@ -125,6 +129,7 @@ def load_state() -> None:
         accepted_completed[:] = list(data.get("accepted_completed", []))
         total_signals_sent_count = int(data.get("total_signals_sent_count", 0))
         total_skipped_count = int(data.get("total_skipped_count", 0))
+        last_daily_summary_date = str(data.get("last_daily_summary_date", ""))
         log.info(
             "Loaded state: %d closed (rich), %d open, %d active signals, "
             "%d accepted completed, sent=%d skipped=%d",
@@ -153,6 +158,7 @@ def save_state() -> None:
                 "accepted_completed": accepted_completed,
                 "total_signals_sent_count": total_signals_sent_count,
                 "total_skipped_count": total_skipped_count,
+                "last_daily_summary_date": last_daily_summary_date,
             }, f, default=str)
         os.replace(tmp, STATE_PATH)
     except Exception as e:
@@ -3401,28 +3407,49 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     }
 
 
+def _fmt_price(p: float) -> str:
+    """Format a price as USD with sensible precision based on magnitude."""
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return "$?"
+    if p <= 0:
+        return f"${p}"
+    if p >= 1000:
+        return f"${p:,.2f}"
+    if p >= 1:
+        return f"${p:.4f}"
+    if p >= 0.001:
+        return f"${p:.5f}"
+    return f"${p:.7f}"
+
+
 def format_message(symbol: str, r: dict) -> str:
-    ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S MYT")
-    price = r["price"]
-    atr_v = r["atr"]
+    ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M MYT")
+    price = float(r["price"])
+    atr_v = float(r["atr"])
     tp_mult = params["tp_mult"]
     sl_mult = params["sl_mult"]
-    if r["direction"] == "LONG":
+    direction = r["direction"]
+    if direction == "LONG":
+        emoji = "🟢"
+        action_label = "Buy at"
         tp = price + tp_mult * atr_v
         sl = price - sl_mult * atr_v
+        why = "Price was very oversold — expecting a bounce up."
     else:
+        emoji = "🔴"
+        action_label = "Sell short at"
         tp = price - tp_mult * atr_v
         sl = price + sl_mult * atr_v
+        why = "Price was very overbought — expecting a drop down."
     return (
-        f"<b>{r['direction']} signal: {symbol}</b>\n"
-        f"Timeframe: {TIMEFRAME}\n"
-        f"Price: {price:.6g}\n"
-        f"RSI(14): {r['rsi']:.2f}\n"
-        f"BB lower/mid/upper: {r['bb_lower']:.6g} / {r['bb_middle']:.6g} / {r['bb_upper']:.6g}\n"
-        f"ATR(14): {atr_v:.6g}\n"
-        f"Take Profit: {tp:.6g}\n"
-        f"Stop Loss: {sl:.6g}\n"
-        f"Time: {ts}"
+        f"{emoji} <b>{direction}: {symbol}</b>\n"
+        f"{action_label}: {_fmt_price(price)}\n"
+        f"Take profit: {_fmt_price(tp)}\n"
+        f"Stop loss: {_fmt_price(sl)}\n"
+        f"Why: {why}\n"
+        f"Sent: {ts}"
     )
 
 
@@ -3450,15 +3477,40 @@ def check_short_exit(r: dict) -> list[str]:
     return reasons
 
 
-def format_close_message(symbol: str, direction: str, r: dict, reasons: list[str]) -> str:
-    ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M:%S MYT")
-    return (
-        f"<b>CLOSE {direction}: {symbol}</b>\n"
-        f"Timeframe: {TIMEFRAME}\n"
-        f"Price: {r['price']:.6g}\n"
-        f"Trigger: {'; '.join(reasons)}\n"
-        f"Time: {ts}"
-    )
+def format_close_message(symbol: str, direction: str, r: dict,
+                         reasons: list[str], entry_price: float | None = None) -> str:
+    ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M MYT")
+    exit_price = float(r["price"])
+    pct = None
+    if entry_price and entry_price > 0:
+        if direction == "LONG":
+            pct = (exit_price - entry_price) / entry_price * 100
+        else:
+            pct = (entry_price - exit_price) / entry_price * 100
+    if direction == "LONG":
+        action_label = "Sell at"
+        plain_reason = "Bounce target reached — time to close."
+    else:
+        action_label = "Buy back at"
+        plain_reason = "Drop target reached — time to close."
+    if pct is None:
+        emoji = "⚪"
+        result_line = ""
+    elif pct >= 0:
+        emoji = "✅"
+        result_line = f"Profit: +{pct:.2f}% from entry\n"
+    else:
+        emoji = "❌"
+        result_line = f"Loss: {pct:.2f}% from entry\n"
+    lines = [
+        f"{emoji} <b>CLOSE {direction}: {symbol}</b>",
+        f"{action_label}: {_fmt_price(exit_price)}",
+    ]
+    if result_line:
+        lines.append(result_line.rstrip("\n"))
+    lines.append(f"Reason: {plain_reason}")
+    lines.append(f"Time: {ts}")
+    return "\n".join(lines)
 
 
 def score_pair(df: pd.DataFrame, symbol: str) -> tuple[str, int]:
@@ -3615,6 +3667,130 @@ def handle_reset_command(reply_to_message_id: int | None = None) -> None:
         "✅ Win rate and trade history reset. Tracking fresh from now.",
         reply_to_message_id=reply_to_message_id,
     )
+
+
+def handle_ping_command(reply_to_message_id: int | None = None) -> None:
+    log.info("Processing /ping command")
+    now = int(time.time())
+    if last_scan_time:
+        age = now - last_scan_time
+        if age < 60:
+            ago = f"{age}s ago"
+        elif age < 3600:
+            ago = f"{age // 60}m ago"
+        else:
+            ago = f"{age // 3600}h {(age % 3600) // 60}m ago"
+        next_in = SCAN_INTERVAL_SECONDS - age
+        if next_in <= 0:
+            next_str = "any moment"
+        elif next_in < 60:
+            next_str = f"in {next_in}s"
+        else:
+            next_str = f"in ~{next_in // 60}m"
+    else:
+        ago = "scan hasn't run yet"
+        next_str = "starting up"
+
+    active = STRATEGIES_BY_ID.get(active_strategy_id) if active_strategy_id else None
+    strat_name = active.name if active else "(unknown)"
+    n_open = len(open_positions)
+    n_pending = sum(
+        1 for s in active_signals.values() if s.get("status") == "pending"
+    )
+    msg = (
+        f"✅ <b>Bot online</b>\n"
+        f"Strategy: {strat_name}\n"
+        f"Last scan: {ago}\n"
+        f"Next scan: {next_str}\n"
+        f"Active positions: {n_open}\n"
+        f"Pending signals: {n_pending}"
+    )
+    send_telegram(msg, reply_to_message_id=reply_to_message_id)
+
+
+def _send_daily_summary() -> None:
+    now = datetime.now(MYT)
+    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_midnight = today_midnight - timedelta(days=1)
+
+    def in_yesterday(time_str: str) -> bool:
+        if not time_str:
+            return False
+        try:
+            t = pd.to_datetime(time_str, utc=True).tz_convert(MYT)
+            return yesterday_midnight <= t < today_midnight
+        except Exception:
+            return False
+
+    y_acc_closed = [
+        t for t in accepted_completed if in_yesterday(t.get("exit_time", ""))
+    ]
+    y_wins = sum(1 for t in y_acc_closed if t.get("win"))
+    y_losses = len(y_acc_closed) - y_wins
+
+    y_total_entries = sum(
+        1 for t in closed_trades if in_yesterday(t.get("entry_time", ""))
+    ) + sum(
+        1 for s in active_signals.values()
+        if in_yesterday(s.get("entry_time", ""))
+    )
+
+    y_accepted_entries = sum(
+        1 for t in accepted_completed if in_yesterday(t.get("entry_time", ""))
+    ) + sum(
+        1 for s in active_signals.values()
+        if s.get("status") == "accepted" and in_yesterday(s.get("entry_time", ""))
+    )
+
+    net_pct = 0.0
+    for t in y_acc_closed:
+        try:
+            entry = float(t.get("entry_price", 0))
+            exit_p = float(t.get("exit_price", 0))
+            if entry <= 0:
+                continue
+            if t.get("direction") == "LONG":
+                net_pct += (exit_p - entry) / entry * 100
+            else:
+                net_pct += (entry - exit_p) / entry * 100
+        except Exception:
+            pass
+
+    n_open = len(open_positions)
+    n_pending = sum(
+        1 for s in active_signals.values() if s.get("status") == "pending"
+    )
+
+    msg = (
+        f"📅 <b>Daily summary — {now.strftime('%Y-%m-%d')}</b>\n\n"
+        f"<b>Yesterday</b>\n"
+        f"Signals fired: {y_total_entries}\n"
+        f"You accepted: {y_accepted_entries}\n"
+        f"Closed: {len(y_acc_closed)} ({y_wins} won, {y_losses} lost)\n"
+        f"Net result on closed: {net_pct:+.2f}%\n\n"
+        f"<b>Right now</b>\n"
+        f"Open positions: {n_open}\n"
+        f"Pending response: {n_pending}\n\n"
+        f"Have a good day."
+    )
+    send_telegram(msg)
+
+
+def _maybe_send_daily_summary() -> None:
+    global last_daily_summary_date
+    now = datetime.now(MYT)
+    today_str = now.strftime("%Y-%m-%d")
+    if now.hour < 8:
+        return
+    if last_daily_summary_date == today_str:
+        return
+    try:
+        _send_daily_summary()
+    except Exception as e:
+        log.warning("daily summary send failed: %s", e)
+        return
+    last_daily_summary_date = today_str
+    save_state()
 
 
 def handle_win_command(reply_to_message_id: int | None = None) -> None:
@@ -4379,6 +4555,8 @@ def telegram_poll_loop() -> None:
                     handle_win_command(msg.get("message_id"))
                 elif cmd == "/reset":
                     handle_reset_command(msg.get("message_id"))
+                elif cmd == "/ping":
+                    handle_ping_command(msg.get("message_id"))
             try:
                 _expire_old_signals()
             except Exception as e:
@@ -4391,6 +4569,8 @@ def telegram_poll_loop() -> None:
 
 
 def scan_once() -> None:
+    global last_scan_time
+    last_scan_time = int(time.time())
     log.info("Starting scan of %d pairs", len(PAIRS))
     with _cache_lock:
         _4h_trend_cache.clear()
@@ -4406,7 +4586,10 @@ def scan_once() -> None:
             if position == "LONG":
                 reasons = check_long_exit(result)
                 if reasons:
-                    send_telegram(format_close_message(symbol, "LONG", result, reasons))
+                    entry_for_msg = position_entry_price.get(symbol)
+                    send_telegram(format_close_message(
+                        symbol, "LONG", result, reasons, entry_for_msg
+                    ))
                     entry = position_entry_price.pop(symbol, None)
                     meta = position_entry_meta.pop(symbol, {})
                     exit_price = float(result["price"])
@@ -4446,7 +4629,10 @@ def scan_once() -> None:
             elif position == "SHORT":
                 reasons = check_short_exit(result)
                 if reasons:
-                    send_telegram(format_close_message(symbol, "SHORT", result, reasons))
+                    entry_for_msg = position_entry_price.get(symbol)
+                    send_telegram(format_close_message(
+                        symbol, "SHORT", result, reasons, entry_for_msg
+                    ))
                     entry = position_entry_price.pop(symbol, None)
                     meta = position_entry_meta.pop(symbol, {})
                     exit_price = float(result["price"])
@@ -4557,6 +4743,10 @@ def main() -> None:
             scan_once()
         except Exception as e:
             log.exception("scan loop error: %s", e)
+        try:
+            _maybe_send_daily_summary()
+        except Exception as e:
+            log.warning("daily summary scheduler failed: %s", e)
         elapsed = time.time() - start
         sleep_for = max(0, SCAN_INTERVAL_SECONDS - int(elapsed))
         log.info("Scan complete in %ds; sleeping %ds", int(elapsed), sleep_for)
