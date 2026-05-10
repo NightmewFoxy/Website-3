@@ -1127,10 +1127,19 @@ def scan_once() -> None:
             if position == "LONG":
                 reasons = check_long_exit(result)
                 if reasons:
-                    entry_for_msg = position_entry_price.get(symbol)
-                    send_telegram(format_close_message(
-                        symbol, "LONG", result, reasons, entry_for_msg
-                    ))
+                    meta_peek = position_entry_meta.get(symbol, {})
+                    sid_peek = meta_peek.get("signal_id")
+                    accepted = bool(
+                        sid_peek and sid_peek in active_signals
+                        and active_signals[sid_peek].get("status") == "accepted"
+                    )
+                    if accepted:
+                        entry_for_msg = position_entry_price.get(symbol)
+                        send_telegram(format_close_message(
+                            symbol, "LONG", result, reasons, entry_for_msg
+                        ))
+                    else:
+                        log.info("%s: LONG close (silent — not accepted)", symbol)
                     entry = position_entry_price.pop(symbol, None)
                     meta = position_entry_meta.pop(symbol, {})
                     exit_price = float(result["price"])
@@ -1170,10 +1179,19 @@ def scan_once() -> None:
             elif position == "SHORT":
                 reasons = check_short_exit(result)
                 if reasons:
-                    entry_for_msg = position_entry_price.get(symbol)
-                    send_telegram(format_close_message(
-                        symbol, "SHORT", result, reasons, entry_for_msg
-                    ))
+                    meta_peek = position_entry_meta.get(symbol, {})
+                    sid_peek = meta_peek.get("signal_id")
+                    accepted = bool(
+                        sid_peek and sid_peek in active_signals
+                        and active_signals[sid_peek].get("status") == "accepted"
+                    )
+                    if accepted:
+                        entry_for_msg = position_entry_price.get(symbol)
+                        send_telegram(format_close_message(
+                            symbol, "SHORT", result, reasons, entry_for_msg
+                        ))
+                    else:
+                        log.info("%s: SHORT close (silent — not accepted)", symbol)
                     entry = position_entry_price.pop(symbol, None)
                     meta = position_entry_meta.pop(symbol, {})
                     exit_price = float(result["price"])
