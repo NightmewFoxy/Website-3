@@ -1234,6 +1234,19 @@ def scan_once() -> None:
             if last_signal_by_pair.get(symbol) == direction:
                 log.info("%s: duplicate %s signal, skipping", symbol, direction)
                 continue
+            # If an accepted trade is currently open, suppress new entries
+            # entirely. The bot keeps scanning but doesn't message the user
+            # until the accepted one is closed.
+            has_open_accepted = any(
+                s.get("status") == "accepted"
+                for s in active_signals.values()
+            )
+            if has_open_accepted:
+                log.info(
+                    "%s: %s signal suppressed — accepted trade still open",
+                    symbol, direction,
+                )
+                continue
             last_signal_by_pair[symbol] = direction
             open_positions[symbol] = direction
             position_entry_price[symbol] = result["price"]
