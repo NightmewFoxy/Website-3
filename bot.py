@@ -818,6 +818,156 @@ def handle_reset_command(reply_to_message_id: int | None = None) -> None:
     )
 
 
+PAPER_NOTIONAL = 100.0
+PAPER_FEE_PCT_ONE_SIDE = 0.0004  # Binance Futures taker 0.04% per side
+
+
+def handle_paper_command(reply_to_message_id: int | None = None) -> None:
+    """Show paper-trading stats assuming every closed trade was auto-executed
+    at fixed $100 notional with Binance taker fees."""
+    log.info("Processing /paper command")
+    if not closed_trades:
+        send_telegram(
+            "No closed trades yet. Paper P&L starts populating after the "
+            "first signal closes (SL hit, TP hit, or strategy exit).",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    notional = PAPER_NOTIONAL
+    fee_rt = 2 * PAPER_FEE_PCT_ONE_SIDE  # round-trip
+    n = len(closed_trades)
+    wins = 0
+    losses = 0
+    gross_total = 0.0
+    fees_total = 0.0
+    best = None
+    worst = None
+    per_pair: dict[str, dict] = {}
+
+    for t in closed_trades:
+        try:
+            entry = float(t["entry_price"])
+            exit_p = float(t["exit_price"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if entry <= 0:
+            continue
+        direction = t.get("direction", "")
+        if direction == "LONG":
+            pct = (exit_p - entry) / entry
+        elif direction == "SHORT":
+            pct = (entry - exit_p) / entry
+        else:
+            continue
+        gross_pnl = notional * pct
+        fee_dollars = notional * fee_rt
+        net_pnl = gross_pnl - fee_dollars
+
+        gross_total += gross_pnl
+        fees_total += fee_dollars
+        if net_pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+
+        if best is None or net_pnl > best["pnl"]:
+            best = {"pnl": net_pnl, "symbol": t.get("symbol", "?"),
+                    "dir": direction, "time": t.get("exit_time", "")}
+        if worst is None or net_pnl < worst["pnl"]:
+            worst = {"pnl": net_pnl, "symbol": t.get("symbol", "?"),
+                     "dir": direction, "time": t.get("exit_time", "")}
+
+        sym = t.get("symbol", "?")
+        if sym not in per_pair:
+            per_pair[sym] = {"trades": 0, "pnl": 0.0}
+        per_pair[sym]["trades"] += 1
+        per_pair[sym]["pnl"] += net_pnl
+
+    net_total = gross_total - fees_total
+    wr = (100.0 * wins / n) if n else 0.0
+    avg_trade = net_total / n if n else 0.0
+
+    capital_ref = notional * 10  # paper account assumed ~$1000 (10 concurrent slots)
+    pct_on_capital = (net_total / capital_ref * 100) if capital_ref else 0.0
+
+    active = STRATEGIES_BY_ID.get(active_strategy_id) if active_strategy_id else None
+    backtest_wr = float(getattr(active, "backtest_wr", 61.3)) if active else 61.3
+    diff = wr - backtest_wr
+
+    # Accepted comparison
+    acc_n = len(accepted_completed)
+    acc_wins = sum(1 for t in accepted_completed if t.get("win"))
+    acc_wr = (100.0 * acc_wins / acc_n) if acc_n else None
+
+    body = (
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"Notional per trade: ${notional:.2f}\n"
+        f"Fees (round-trip):  {fee_rt*100:.2f}%\n"
+        "\n"
+        f"Total trades:       {n}\n"
+        f"Wins:               {wins}\n"
+        f"Losses:             {losses}\n"
+        f"Win rate:           {wr:.1f}%\n"
+        "\n"
+        f"Gross P&L:          {gross_total:+.2f} USD\n"
+        f"Fees paid:          -{fees_total:.2f} USD\n"
+        f"Net P&L:            {net_total:+.2f} USD\n"
+        f"On ${capital_ref:.0f} capital:   {pct_on_capital:+.2f}%\n"
+        f"Avg trade:          {avg_trade:+.3f} USD\n"
+    )
+    if best is not None:
+        body += (
+            "\n"
+            f"Best:  {best['symbol']} {best['dir']} {best['pnl']:+.2f} USD "
+            f"({str(best['time'])[:10]})\n"
+            f"Worst: {worst['symbol']} {worst['dir']} {worst['pnl']:+.2f} USD "
+            f"({str(worst['time'])[:10]})\n"
+        )
+    body += (
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"Backtest WR: {backtest_wr:.1f}%\n"
+        f"Paper WR:    {wr:.1f}% ({diff:+.1f} pp vs backtest)\n"
+    )
+    if acc_wr is not None:
+        body += f"Your accepted WR: {acc_wr:.1f}% (n={acc_n})\n"
+
+    msg = (
+        f"📄 <b>Paper Trading — Williams %R</b>\n"
+        f"<pre>{body}</pre>"
+    )
+    send_telegram(msg, reply_to_message_id=reply_to_message_id)
+
+
+def handle_commands_command(reply_to_message_id: int | None = None) -> None:
+    log.info("Processing /commands command")
+    msg = (
+        "<b>📖 Available commands</b>\n\n"
+        "<b>Trade tracking</b>\n"
+        "<code>/positions</code> — open positions you accepted, with live P&L\n"
+        "<code>/win</code> — performance stats on your accepted trades\n"
+        "<code>/paper</code> — what auto-trading every signal would have earned\n"
+        "<code>/reset</code> — wipe win/loss history\n"
+        "\n"
+        "<b>Manual position control</b>\n"
+        "<code>/cancel SYMBOL</code> — order never filled, drop from tracking (no stats impact)\n"
+        "<code>/close SYMBOL</code> — you exited manually, record close at market\n"
+        "<code>/reopen SYMBOL LONG|SHORT [price]</code> — re-attach a position\n"
+        "(also <code>/cancel all</code>, <code>/close all</code>)\n"
+        "\n"
+        "<b>Info / health</b>\n"
+        "<code>/check</code> — confluence scores across all 20 pairs\n"
+        "<code>/ping</code> — bot online? last/next scan? open count?\n"
+        "<code>/commands</code> — this list\n"
+        "\n"
+        "<b>On each signal</b>\n"
+        "✅ I'm In — bot will message you when conditions say close\n"
+        "❌ Skip — bot ignores it for your stats\n"
+        "(no tap within 4h = auto-skip)"
+    )
+    send_telegram(msg, reply_to_message_id=reply_to_message_id)
+
+
 def handle_ping_command(reply_to_message_id: int | None = None) -> None:
     log.info("Processing /ping command")
     now = int(time.time())
@@ -1479,6 +1629,10 @@ def telegram_poll_loop() -> None:
                     handle_reset_command(msg.get("message_id"))
                 elif cmd == "/ping":
                     handle_ping_command(msg.get("message_id"))
+                elif cmd == "/paper":
+                    handle_paper_command(msg.get("message_id"))
+                elif cmd == "/commands":
+                    handle_commands_command(msg.get("message_id"))
                 elif cmd == "/positions":
                     handle_positions_command(msg.get("message_id"))
                 elif cmd == "/close":
