@@ -584,6 +584,7 @@ def _close_position_at(symbol: str, position: str, exit_price: float,
     meta = position_entry_meta.pop(symbol, {})
     if entry is None:
         open_positions.pop(symbol, None)
+        last_signal_by_pair.pop(symbol, None)
         save_state()
         return False
 
@@ -626,6 +627,7 @@ def _close_position_at(symbol: str, position: str, exit_price: float,
             accepted_completed.append(acc_record)
 
     open_positions.pop(symbol, None)
+    last_signal_by_pair.pop(symbol, None)
     save_state()
     return accepted
 
@@ -1490,6 +1492,7 @@ def scan_once() -> None:
                                     "exit_reason": "; ".join(reasons),
                                 })
                     open_positions.pop(symbol, None)
+                    last_signal_by_pair.pop(symbol, None)
                     save_state()
                     log.info("%s: CLOSE LONG sent (%s)", symbol, "; ".join(reasons))
             elif position == "SHORT":
@@ -1541,6 +1544,7 @@ def scan_once() -> None:
                                     "exit_reason": "; ".join(reasons),
                                 })
                     open_positions.pop(symbol, None)
+                    last_signal_by_pair.pop(symbol, None)
                     save_state()
                     log.info("%s: CLOSE SHORT sent (%s)", symbol, "; ".join(reasons))
 
