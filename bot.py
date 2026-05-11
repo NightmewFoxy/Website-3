@@ -818,7 +818,9 @@ def handle_reset_command(reply_to_message_id: int | None = None) -> None:
     )
 
 
-PAPER_NOTIONAL = 100.0
+PAPER_MARGIN = 100.0       # USDT margin per trade
+PAPER_LEVERAGE = 10        # 10x leverage
+PAPER_NOTIONAL = PAPER_MARGIN * PAPER_LEVERAGE  # = $1000 effective position size
 PAPER_FEE_PCT_ONE_SIDE = 0.0004  # Binance Futures taker 0.04% per side
 
 
@@ -887,9 +889,7 @@ def handle_paper_command(reply_to_message_id: int | None = None) -> None:
     net_total = gross_total - fees_total
     wr = (100.0 * wins / n) if n else 0.0
     avg_trade = net_total / n if n else 0.0
-
-    capital_ref = notional * 10  # paper account assumed ~$1000 (10 concurrent slots)
-    pct_on_capital = (net_total / capital_ref * 100) if capital_ref else 0.0
+    pct_on_margin = (net_total / (PAPER_MARGIN * n) * 100) if n else 0.0
 
     active = STRATEGIES_BY_ID.get(active_strategy_id) if active_strategy_id else None
     backtest_wr = float(getattr(active, "backtest_wr", 61.3)) if active else 61.3
@@ -902,19 +902,21 @@ def handle_paper_command(reply_to_message_id: int | None = None) -> None:
 
     body = (
         "━━━━━━━━━━━━━━━━━━━\n"
-        f"Notional per trade: ${notional:.2f}\n"
-        f"Fees (round-trip):  {fee_rt*100:.2f}%\n"
+        f"Margin per trade:   ${PAPER_MARGIN:.0f} USDT\n"
+        f"Leverage:           {PAPER_LEVERAGE}x\n"
+        f"Effective notional: ${notional:.0f}\n"
+        f"Fees (round-trip):  {fee_rt*100:.2f}% (Binance taker)\n"
         "\n"
         f"Total trades:       {n}\n"
         f"Wins:               {wins}\n"
         f"Losses:             {losses}\n"
         f"Win rate:           {wr:.1f}%\n"
         "\n"
-        f"Gross P&L:          {gross_total:+.2f} USD\n"
-        f"Fees paid:          -{fees_total:.2f} USD\n"
-        f"Net P&L:            {net_total:+.2f} USD\n"
-        f"On ${capital_ref:.0f} capital:   {pct_on_capital:+.2f}%\n"
-        f"Avg trade:          {avg_trade:+.3f} USD\n"
+        f"Gross P&L:          {gross_total:+.2f} USDT\n"
+        f"Fees paid:          -{fees_total:.2f} USDT\n"
+        f"Net P&L:            {net_total:+.2f} USDT\n"
+        f"Return on margin:   {pct_on_margin:+.2f}% per ${PAPER_MARGIN:.0f}\n"
+        f"Avg trade:          {avg_trade:+.2f} USDT\n"
     )
     if best is not None:
         body += (
