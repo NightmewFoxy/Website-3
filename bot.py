@@ -63,26 +63,20 @@ PARAMS_PATH = os.environ.get(
 )
 
 # Live ATR multipliers used in entry messages and SL distance calculations.
+# These match the values backtest_strategy uses (the _Strategy class defaults)
+# so live signal SL/TP equals the SL/TP that produced the 61.3% backtest WR.
 DEFAULT_PARAMS: dict = {
-    "sl_mult": 1.0,
-    "tp_mult": 2.0,
+    "sl_mult": 1.5,
+    "tp_mult": 2.5,
 }
 
 params: dict = dict(DEFAULT_PARAMS)
 
 
 def load_params() -> None:
-    if not os.path.exists(PARAMS_PATH):
-        return
-    try:
-        with open(PARAMS_PATH) as f:
-            saved = json.load(f)
-        for k in DEFAULT_PARAMS:
-            if k in saved:
-                params[k] = saved[k]
-        log.info("Loaded params: %s", params)
-    except Exception as e:
-        log.warning("Failed to load params from %s: %s", PARAMS_PATH, e)
+    # SL/TP multipliers are now hardcoded to match backtest values, so we
+    # ignore any saved params.json from earlier strategy iterations.
+    log.info("Active params (hardcoded): %s", params)
 
 
 
