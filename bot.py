@@ -998,6 +998,53 @@ def handle_win_command(reply_to_message_id: int | None = None) -> None:
     send_telegram(msg, reply_to_message_id=reply_to_message_id)
 
 
+def handle_positions_command(reply_to_message_id: int | None = None) -> None:
+    log.info("Processing /positions command")
+    if not open_positions:
+        send_telegram(
+            "No open positions right now.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    lines = ["📊 <b>Open Positions</b>", ""]
+    for symbol, direction in open_positions.items():
+        entry = position_entry_price.get(symbol)
+        meta = position_entry_meta.get(symbol, {})
+        sid = meta.get("signal_id")
+        status = "(no signal record)"
+        if sid and sid in active_signals:
+            status = active_signals[sid].get("status", "?")
+
+        current = None
+        try:
+            df = fetch_klines(symbol, limit=2)
+            if len(df) > 0:
+                current = float(df["close"].iloc[-1])
+        except Exception as e:
+            log.warning("/positions %s price fetch failed: %s", symbol, e)
+
+        emoji = "🟢" if direction == "LONG" else "🔴"
+        lines.append(f"{emoji} <b>{direction} {symbol}</b>")
+        if entry:
+            lines.append(f"Entry: {_fmt_price(entry)}")
+        if current is not None:
+            lines.append(f"Now: {_fmt_price(current)}")
+            if entry and entry > 0:
+                if direction == "LONG":
+                    pct = (current - entry) / entry * 100
+                else:
+                    pct = (entry - current) / entry * 100
+                if pct >= 0:
+                    lines.append(f"P&L: <b>+{pct:.2f}%</b>")
+                else:
+                    lines.append(f"P&L: <b>{pct:.2f}%</b>")
+        lines.append(f"Status: {status}")
+        lines.append("")
+
+    send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
+
+
 def handle_check_command(reply_to_message_id: int | None = None) -> None:
     log.info("Processing /check command")
     rankings: list[tuple[str, str, int]] = []
@@ -1100,6 +1147,8 @@ def telegram_poll_loop() -> None:
                     handle_reset_command(msg.get("message_id"))
                 elif cmd == "/ping":
                     handle_ping_command(msg.get("message_id"))
+                elif cmd == "/positions":
+                    handle_positions_command(msg.get("message_id"))
             try:
                 _expire_old_signals()
             except Exception as e:
