@@ -1092,6 +1092,128 @@ def handle_win_command(reply_to_message_id: int | None = None) -> None:
     send_telegram(msg, reply_to_message_id=reply_to_message_id)
 
 
+def handle_reopen_command(args: list[str], reply_to_message_id: int | None = None) -> None:
+    """Manually re-attach a position to the bot's tracking.
+    Usage: /reopen SYMBOL LONG|SHORT [entry_price]"""
+    log.info("Processing /reopen command: %s", args)
+    if len(args) < 2:
+        send_telegram(
+            "Usage: <code>/reopen SYMBOL LONG|SHORT [entry_price]</code>\n\n"
+            "Use this if you cancelled but your order actually filled, or "
+            "if you took a trade outside the bot and want it to manage the "
+            "close for you.\n\n"
+            "Examples:\n"
+            "<code>/reopen BNBUSDT LONG</code> (uses current market price)\n"
+            "<code>/reopen BNBUSDT LONG 567.50</code> (specify entry)",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    symbol = args[0].upper()
+    direction = args[1].upper()
+    if direction not in ("LONG", "SHORT"):
+        send_telegram(
+            "Direction must be <code>LONG</code> or <code>SHORT</code>.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+    if symbol not in PAIRS:
+        send_telegram(
+            f"<b>{symbol}</b> is not in the bot's pair list.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+    if symbol in open_positions:
+        send_telegram(
+            f"Already tracking a {open_positions[symbol]} position on "
+            f"<b>{symbol}</b>. Use <code>/cancel {symbol}</code> first if "
+            "you want to replace it.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    entry_price = None
+    if len(args) >= 3:
+        try:
+            entry_price = float(args[2])
+        except ValueError:
+            send_telegram(
+                f"Invalid entry price: <code>{args[2]}</code>",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+    try:
+        df = fetch_klines(symbol)
+        if len(df) < 14:
+            send_telegram(
+                f"Not enough data to set up {symbol}.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        atr_series = atr(df["high"], df["low"], df["close"], 14)
+        atr_at_entry = float(atr_series.iloc[-1])
+        if entry_price is None:
+            entry_price = float(df["close"].iloc[-1])
+        entry_time = str(df["close_time"].iloc[-1])
+    except Exception as e:
+        send_telegram(
+            f"Failed to fetch data for {symbol}: {e}",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    sl_mult_v = float(params.get("sl_mult", 1.0))
+    tp_mult_v = float(params.get("tp_mult", 2.0))
+    sl_distance = atr_at_entry * sl_mult_v
+    if direction == "LONG":
+        sl_price = entry_price - sl_distance
+        tp_price = entry_price + tp_mult_v * atr_at_entry
+    else:
+        sl_price = entry_price + sl_distance
+        tp_price = entry_price - tp_mult_v * atr_at_entry
+
+    signal_id = f"{symbol}_{direction}_{int(time.time() * 1000)}_manual"
+    sent_at_ts = int(time.time())
+
+    open_positions[symbol] = direction
+    position_entry_price[symbol] = float(entry_price)
+    position_entry_meta[symbol] = {
+        "entry_time": entry_time,
+        "atr": atr_at_entry,
+        "sl_mult": sl_mult_v,
+        "sl_distance": sl_distance,
+        "signal_id": signal_id,
+    }
+    last_signal_by_pair[symbol] = direction
+    active_signals[signal_id] = {
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "direction": direction,
+        "entry_price": float(entry_price),
+        "entry_time": entry_time,
+        "atr_at_entry": atr_at_entry,
+        "sl_distance": sl_distance,
+        "sent_at": sent_at_ts,
+        "status": "accepted",
+        "original_text": f"Manually reopened {direction} {symbol}",
+        "message_id": None,
+        "manual_reopen": True,
+    }
+    save_state()
+
+    emoji = "🟢" if direction == "LONG" else "🔴"
+    send_telegram(
+        f"{emoji} <b>Reopened: {direction} {symbol}</b>\n"
+        f"Entry: {_fmt_price(entry_price)}\n"
+        f"Take profit: {_fmt_price(tp_price)}\n"
+        f"Stop loss: {_fmt_price(sl_price)}\n\n"
+        f"The bot will tell you when to close. Use /positions to verify.",
+        reply_to_message_id=reply_to_message_id,
+    )
+    log.info("/reopen: %s %s @ %.6g", symbol, direction, entry_price)
+
+
 def handle_cancel_command(args: list[str], reply_to_message_id: int | None = None) -> None:
     """Remove a position from tracking without recording a trade.
     Use when a signal fired but your order didn't fill (so you're not in it)."""
@@ -1363,6 +1485,8 @@ def telegram_poll_loop() -> None:
                     handle_close_command(parts[1:], msg.get("message_id"))
                 elif cmd == "/cancel":
                     handle_cancel_command(parts[1:], msg.get("message_id"))
+                elif cmd == "/reopen":
+                    handle_reopen_command(parts[1:], msg.get("message_id"))
             try:
                 _expire_old_signals()
             except Exception as e:
