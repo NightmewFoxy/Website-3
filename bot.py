@@ -1145,22 +1145,29 @@ def handle_close_command(args: list[str], reply_to_message_id: int | None = None
 
 def handle_positions_command(reply_to_message_id: int | None = None) -> None:
     log.info("Processing /positions command")
-    if not open_positions:
+    # Only show positions the user explicitly accepted. Skipped, pending,
+    # expired, or pre-deploy positions are tracked internally but not
+    # displayed here — they aren't trades the user is actually in.
+    accepted_open: list[tuple[str, str]] = []
+    for symbol, direction in open_positions.items():
+        meta = position_entry_meta.get(symbol, {})
+        sid = meta.get("signal_id")
+        if not sid or sid not in active_signals:
+            continue
+        if active_signals[sid].get("status") != "accepted":
+            continue
+        accepted_open.append((symbol, direction))
+
+    if not accepted_open:
         send_telegram(
-            "No open positions right now.",
+            "No accepted open positions right now.",
             reply_to_message_id=reply_to_message_id,
         )
         return
 
     lines = ["📊 <b>Open Positions</b>", ""]
-    for symbol, direction in open_positions.items():
+    for symbol, direction in accepted_open:
         entry = position_entry_price.get(symbol)
-        meta = position_entry_meta.get(symbol, {})
-        sid = meta.get("signal_id")
-        status = "(no signal record)"
-        if sid and sid in active_signals:
-            status = active_signals[sid].get("status", "?")
-
         current = None
         try:
             df = fetch_klines(symbol, limit=2)
@@ -1184,7 +1191,6 @@ def handle_positions_command(reply_to_message_id: int | None = None) -> None:
                     lines.append(f"P&L: <b>+{pct:.2f}%</b>")
                 else:
                     lines.append(f"P&L: <b>{pct:.2f}%</b>")
-        lines.append(f"Status: {status}")
         lines.append("")
 
     send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
