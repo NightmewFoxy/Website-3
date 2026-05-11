@@ -538,6 +538,98 @@ def evaluate(df: pd.DataFrame, symbol: str) -> dict:
     }
 
 
+def _detect_sl_tp_hit(df, position: str, entry, sl_distance: float,
+                      tp_distance: float, entry_time_str: str):
+    """Walk candles after entry_time. Return (type, price) on first SL or TP
+    hit, else None. SL takes priority if both hit in the same candle."""
+    if not entry_time_str or entry is None or sl_distance <= 0:
+        return None
+    try:
+        entry_ts = pd.to_datetime(entry_time_str, utc=True)
+    except Exception:
+        return None
+    entry = float(entry)
+    if position == "LONG":
+        sl_price = entry - sl_distance
+        tp_price = entry + tp_distance
+    else:
+        sl_price = entry + sl_distance
+        tp_price = entry - tp_distance
+    relevant = df[df["close_time"] > entry_ts]
+    if len(relevant) == 0:
+        return None
+    highs = relevant["high"].values
+    lows = relevant["low"].values
+    for i in range(len(relevant)):
+        h = float(highs[i])
+        l = float(lows[i])
+        if position == "LONG":
+            sl_hit = l <= sl_price
+            tp_hit = h >= tp_price
+        else:
+            sl_hit = h >= sl_price
+            tp_hit = l <= tp_price
+        if sl_hit:
+            return ("SL", sl_price)
+        if tp_hit:
+            return ("TP", tp_price)
+    return None
+
+
+def _close_position_at(symbol: str, position: str, exit_price: float,
+                      exit_time_str: str, reason_label: str,
+                      hit_r: float | None = None) -> bool:
+    """Pop position state and append rich close records. Returns True if accepted."""
+    entry = position_entry_price.pop(symbol, None)
+    meta = position_entry_meta.pop(symbol, {})
+    if entry is None:
+        open_positions.pop(symbol, None)
+        save_state()
+        return False
+
+    sl_dist = float(meta.get("sl_distance", 0.0))
+    if position == "LONG":
+        win_bool = exit_price > float(entry)
+    else:
+        win_bool = exit_price < float(entry)
+
+    if hit_r is not None:
+        r_mult = float(hit_r)
+    elif sl_dist > 0:
+        if position == "LONG":
+            r_mult = (exit_price - float(entry)) / sl_dist
+        else:
+            r_mult = (float(entry) - exit_price) / sl_dist
+    else:
+        r_mult = 0.0
+
+    trade_results.append(win_bool)
+    record = {
+        "symbol": symbol, "direction": position,
+        "entry_price": float(entry), "exit_price": float(exit_price),
+        "entry_time": meta.get("entry_time", ""),
+        "exit_time": exit_time_str,
+        "sl_distance": sl_dist, "r": r_mult,
+        "win": win_bool,
+        "exit_reason": reason_label,
+    }
+    closed_trades.append(record)
+
+    sid = meta.get("signal_id")
+    accepted = False
+    if sid and sid in active_signals:
+        sig = active_signals.pop(sid)
+        if sig.get("status") == "accepted":
+            accepted = True
+            acc_record = dict(record)
+            acc_record["entry_time"] = sig.get("entry_time", record["entry_time"])
+            accepted_completed.append(acc_record)
+
+    open_positions.pop(symbol, None)
+    save_state()
+    return accepted
+
+
 def _fmt_price(p: float) -> str:
     """Format a price as USD with sensible precision based on magnitude."""
     try:
@@ -998,6 +1090,59 @@ def handle_win_command(reply_to_message_id: int | None = None) -> None:
     send_telegram(msg, reply_to_message_id=reply_to_message_id)
 
 
+def handle_close_command(args: list[str], reply_to_message_id: int | None = None) -> None:
+    """Manually close a position. Usage: /close BTCUSDT [or /close all]"""
+    log.info("Processing /close command: %s", args)
+    if not args:
+        send_telegram(
+            "Usage: <code>/close SYMBOL</code> or <code>/close all</code>",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+    target = args[0].upper()
+    if target == "ALL":
+        if not open_positions:
+            send_telegram("No open positions to close.",
+                          reply_to_message_id=reply_to_message_id)
+            return
+        symbols = list(open_positions.keys())
+    else:
+        if target not in open_positions:
+            send_telegram(
+                f"No open position for <b>{target}</b>.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        symbols = [target]
+
+    closed = []
+    for sym in symbols:
+        position = open_positions.get(sym)
+        if position is None:
+            continue
+        # Use the latest available price as the exit
+        try:
+            df = fetch_klines(sym, limit=2)
+            exit_price = float(df["close"].iloc[-1]) if len(df) > 0 else 0.0
+            exit_time = str(df["close_time"].iloc[-1]) if len(df) > 0 else ""
+        except Exception as e:
+            log.warning("/close %s price fetch failed: %s", sym, e)
+            exit_price = float(position_entry_price.get(sym, 0.0))
+            exit_time = datetime.now(MYT).isoformat()
+        _close_position_at(sym, position, exit_price, exit_time,
+                           "Manually closed via /close")
+        closed.append((sym, position, exit_price))
+        log.info("/close: %s %s closed manually at %.6g", sym, position, exit_price)
+
+    if not closed:
+        send_telegram("Nothing closed.", reply_to_message_id=reply_to_message_id)
+        return
+    lines = ["✅ <b>Manually closed:</b>"]
+    for sym, pos, px in closed:
+        lines.append(f"• {pos} {sym} at {_fmt_price(px)}")
+    send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
+
+
 def handle_positions_command(reply_to_message_id: int | None = None) -> None:
     log.info("Processing /positions command")
     if not open_positions:
@@ -1149,6 +1294,8 @@ def telegram_poll_loop() -> None:
                     handle_ping_command(msg.get("message_id"))
                 elif cmd == "/positions":
                     handle_positions_command(msg.get("message_id"))
+                elif cmd == "/close":
+                    handle_close_command(parts[1:], msg.get("message_id"))
             try:
                 _expire_old_signals()
             except Exception as e:
@@ -1173,6 +1320,61 @@ def scan_once() -> None:
             result = evaluate(df, symbol)
 
             position = open_positions.get(symbol)
+
+            # SL/TP detection on candles after entry. If hit, close at the
+            # SL or TP price and skip the strategy-exit check below.
+            if position is not None:
+                meta_peek = position_entry_meta.get(symbol, {})
+                entry_peek = position_entry_price.get(symbol)
+                sl_dist_peek = float(meta_peek.get("sl_distance", 0.0))
+                sl_mult_v = float(meta_peek.get("sl_mult", 1.0)) or 1.0
+                tp_mult_p = float(params.get("tp_mult", 2.0))
+                tp_dist_peek = sl_dist_peek * (tp_mult_p / sl_mult_v)
+                entry_time_str = meta_peek.get("entry_time", "")
+                sl_tp = _detect_sl_tp_hit(
+                    df, position, entry_peek, sl_dist_peek,
+                    tp_dist_peek, entry_time_str,
+                )
+                if sl_tp:
+                    hit_type, hit_price = sl_tp
+                    sid_peek = meta_peek.get("signal_id")
+                    accepted_peek = bool(
+                        sid_peek and sid_peek in active_signals
+                        and active_signals[sid_peek].get("status") == "accepted"
+                    )
+                    if accepted_peek and entry_peek and entry_peek > 0:
+                        if position == "LONG":
+                            pct = (hit_price - entry_peek) / entry_peek * 100
+                        else:
+                            pct = (entry_peek - hit_price) / entry_peek * 100
+                        pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+                        emoji = "❌" if hit_type == "SL" else "✅"
+                        reason_msg = ("Stop loss triggered"
+                                      if hit_type == "SL" else "Take profit hit")
+                        ts = datetime.now(MYT).strftime("%Y-%m-%d %H:%M MYT")
+                        send_telegram(
+                            f"{emoji} <b>CLOSE {position}: {symbol}</b>\n"
+                            f"Closed at: {_fmt_price(hit_price)}\n"
+                            f"P&L: {pct_str} from entry\n"
+                            f"Reason: {reason_msg}\n"
+                            f"Time: {ts}"
+                        )
+                    elif not accepted_peek:
+                        log.info("%s: %s %s hit (silent — not accepted)",
+                                 symbol, position, hit_type)
+                    last_ct = str(df["close_time"].iloc[-1])
+                    r_val = -1.0 if hit_type == "SL" else (
+                        tp_mult_p / sl_mult_v if sl_mult_v > 0 else 0.0
+                    )
+                    reason_label = (f"SL hit at {_fmt_price(hit_price)}"
+                                    if hit_type == "SL"
+                                    else f"TP hit at {_fmt_price(hit_price)}")
+                    _close_position_at(symbol, position, hit_price,
+                                       last_ct, reason_label, hit_r=r_val)
+                    log.info("%s: %s %s hit, closed at %.6g",
+                             symbol, position, hit_type, hit_price)
+                    position = None  # skip strategy-exit branch
+
             if position == "LONG":
                 reasons = check_long_exit(result)
                 if reasons:
