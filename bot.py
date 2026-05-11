@@ -1090,6 +1090,63 @@ def handle_win_command(reply_to_message_id: int | None = None) -> None:
     send_telegram(msg, reply_to_message_id=reply_to_message_id)
 
 
+def handle_cancel_command(args: list[str], reply_to_message_id: int | None = None) -> None:
+    """Remove a position from tracking without recording a trade.
+    Use when a signal fired but your order didn't fill (so you're not in it)."""
+    log.info("Processing /cancel command: %s", args)
+    if not args:
+        send_telegram(
+            "Usage: <code>/cancel SYMBOL</code> or <code>/cancel all</code>\n\n"
+            "Use this if the signal fired and you tapped ✅ I'm In, but your "
+            "order never filled and you're not actually in the trade. "
+            "The bot will forget the position and resume sending new signals.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+    target = args[0].upper()
+    if target == "ALL":
+        if not open_positions:
+            send_telegram("No open positions to cancel.",
+                          reply_to_message_id=reply_to_message_id)
+            return
+        symbols = list(open_positions.keys())
+    else:
+        if target not in open_positions:
+            send_telegram(
+                f"No open position for <b>{target}</b>.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        symbols = [target]
+
+    cancelled: list[tuple[str, str]] = []
+    for sym in symbols:
+        position = open_positions.get(sym)
+        if position is None:
+            continue
+        meta = position_entry_meta.pop(sym, {})
+        position_entry_price.pop(sym, None)
+        last_signal_by_pair.pop(sym, None)
+        open_positions.pop(sym, None)
+        sid = meta.get("signal_id")
+        if sid and sid in active_signals:
+            active_signals.pop(sid)
+        cancelled.append((sym, position))
+        log.info("/cancel: %s %s removed from tracking (no trade recorded)",
+                 sym, position)
+    save_state()
+
+    if not cancelled:
+        send_telegram("Nothing cancelled.", reply_to_message_id=reply_to_message_id)
+        return
+    lines = ["🗑️ <b>Cancelled (not recorded as a trade):</b>"]
+    for sym, pos in cancelled:
+        lines.append(f"• {pos} {sym}")
+    lines.append("")
+    lines.append("The bot will resume sending new signals.")
+    send_telegram("\n".join(lines), reply_to_message_id=reply_to_message_id)
+
+
 def handle_close_command(args: list[str], reply_to_message_id: int | None = None) -> None:
     """Manually close a position. Usage: /close BTCUSDT [or /close all]"""
     log.info("Processing /close command: %s", args)
@@ -1302,6 +1359,8 @@ def telegram_poll_loop() -> None:
                     handle_positions_command(msg.get("message_id"))
                 elif cmd == "/close":
                     handle_close_command(parts[1:], msg.get("message_id"))
+                elif cmd == "/cancel":
+                    handle_cancel_command(parts[1:], msg.get("message_id"))
             try:
                 _expire_old_signals()
             except Exception as e:
