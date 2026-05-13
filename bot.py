@@ -729,6 +729,22 @@ def score_pair(df: pd.DataFrame, symbol: str) -> tuple[str, int]:
     return "LONG", 0
 
 
+def _release_tentative_tracking(sid: str, sig: dict) -> None:
+    """Clear open_positions / entry meta that scan_once sets the moment a
+    signal fires. Called when the user skips or the signal expires, so a
+    non-accepted signal doesn't leave a phantom position behind."""
+    sym = sig.get("symbol")
+    if not sym:
+        return
+    meta_sym = position_entry_meta.get(sym, {})
+    if meta_sym.get("signal_id") != sid:
+        return
+    position_entry_meta.pop(sym, None)
+    position_entry_price.pop(sym, None)
+    open_positions.pop(sym, None)
+    last_signal_by_pair.pop(sym, None)
+
+
 def _handle_signal_callback(cb: dict, target_chat: str) -> None:
     cb_id = cb.get("id", "")
     data = cb.get("data", "") or ""
@@ -762,6 +778,7 @@ def _handle_signal_callback(cb: dict, target_chat: str) -> None:
     elif action == "skip":
         sig["status"] = "skipped"
         total_skipped_count += 1
+        _release_tentative_tracking(sid, sig)
         save_state()
         if msg_id:
             edit_telegram_message(msg_id, original + "\n\n<b>❌ Skipped</b>")
@@ -787,6 +804,7 @@ def _expire_old_signals() -> None:
         sig["status"] = "skipped"
         sig["expired"] = True
         total_skipped_count += 1
+        _release_tentative_tracking(sid, sig)
         msg_id = sig.get("message_id")
         if msg_id:
             edit_telegram_message(
