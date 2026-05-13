@@ -770,11 +770,30 @@ def _handle_signal_callback(cb: dict, target_chat: str) -> None:
     global total_skipped_count
     if action == "accept":
         sig["status"] = "accepted"
+        auto_skipped = 0
+        for other_sid, other_sig in list(active_signals.items()):
+            if other_sid == sid:
+                continue
+            if other_sig.get("status") != "pending":
+                continue
+            other_sig["status"] = "skipped"
+            other_sig["auto_skipped"] = True
+            total_skipped_count += 1
+            _release_tentative_tracking(other_sid, other_sig)
+            other_msg_id = other_sig.get("message_id")
+            other_original = other_sig.get("original_text", "")
+            if other_msg_id:
+                edit_telegram_message(
+                    other_msg_id,
+                    other_original + "\n\n<b>❌ Auto-skipped (another trade accepted)</b>",
+                )
+            auto_skipped += 1
+            log.info("signal auto-skipped: %s", other_sid)
         save_state()
         if msg_id:
             edit_telegram_message(msg_id, original + "\n\n<b>✅ Accepted</b>")
         answer_callback_query(cb_id, "Trade accepted")
-        log.info("signal accepted: %s", sid)
+        log.info("signal accepted: %s (auto-skipped %d others)", sid, auto_skipped)
     elif action == "skip":
         sig["status"] = "skipped"
         total_skipped_count += 1
