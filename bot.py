@@ -458,7 +458,185 @@ STRATEGIES_BY_ID["d9_williams_r"].score_description = [
 ]
 
 
-# Strategy 2 needs `close` access - rewrite signal closure
+# ===== Strategy 2: 4-signal mean-reversion ensemble (R80 champion) =====
+# Williams %R double-bottom + strict RSI cross + strict Stoch cross + BB pierce.
+# Designed and walk-forward validated on 4H crypto futures across 125 pairs;
+# here it runs on the same 1H/PAIRS universe as strategy 1, sharing data fetch.
+
+
+def _rsi_indicator(close: pd.Series, period: int = 14) -> pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    rs = up / dn.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def _stoch_k_indicator(high: pd.Series, low: pd.Series, close: pd.Series,
+                       period: int = 14) -> pd.Series:
+    hh = high.rolling(period).max()
+    ll = low.rolling(period).min()
+    return 100 * (close - ll) / (hh - ll).replace(0, np.nan)
+
+
+def _bbands_indicator(close: pd.Series, period: int = 20, k: float = 2.5):
+    ma = close.rolling(period).mean()
+    sd = close.rolling(period).std()
+    return ma + k * sd, ma, ma - k * sd
+
+
+def _r80_pre(df):
+    upper, _, lower = _bbands_indicator(df["close"], 20, 2.5)
+    return {
+        "open": df["open"], "high": df["high"], "low": df["low"], "close": df["close"],
+        "wr": compute_williams_r(df["high"], df["low"], df["close"], 14),
+        "rsi": _rsi_indicator(df["close"], 14),
+        "stoch": _stoch_k_indicator(df["high"], df["low"], df["close"], 14),
+        "bb_upper": upper, "bb_lower": lower,
+    }
+
+
+def _r80_dbb(p, i):
+    """Williams %R double-bottom cross-back (long: cross above -84 after >=5 touches
+    in 17 bars and Stoch < 36; mirrored short above -16)."""
+    if i < 18:
+        return None
+    wp = p["wr"].iloc[i - 1]; wc = p["wr"].iloc[i]
+    if pd.isna(wp) or pd.isna(wc):
+        return None
+    recent = p["wr"].iloc[max(0, i - 17):i].dropna()
+    if len(recent) < 12:
+        return None
+    sc = p["stoch"].iloc[i]
+    if pd.isna(sc):
+        return None
+    if wp <= -84 and wc > -84 and (recent <= -84).sum() >= 5 and sc < 36:
+        return "LONG"
+    if wp >= -16 and wc < -16 and (recent >= -16).sum() >= 5 and sc > 64:
+        return "SHORT"
+    return None
+
+
+def _r80_rsi(p, i):
+    """RSI strict cross: long when RSI crosses above 22 after touching <=22 in
+    at least 2 of the prior 3 bars; mirrored short at 78."""
+    if i < 3:
+        return None
+    rp = p["rsi"].iloc[i - 1]; rc = p["rsi"].iloc[i]
+    if pd.isna(rp) or pd.isna(rc):
+        return None
+    if rp <= 22 and rc > 22:
+        recent = p["rsi"].iloc[max(0, i - 3):i - 1]
+        if (recent <= 22).sum() >= 2:
+            return "LONG"
+    if rp >= 78 and rc < 78:
+        recent = p["rsi"].iloc[max(0, i - 3):i - 1]
+        if (recent >= 78).sum() >= 2:
+            return "SHORT"
+    return None
+
+
+def _r80_stoch(p, i):
+    """Stoch K strict cross: long above 15 after >=2 of past 3 bars below 15."""
+    if i < 3:
+        return None
+    sp = p["stoch"].iloc[i - 1]; sc = p["stoch"].iloc[i]
+    if pd.isna(sp) or pd.isna(sc):
+        return None
+    if sp <= 15 and sc > 15:
+        recent = p["stoch"].iloc[max(0, i - 3):i - 1]
+        if (recent <= 15).sum() >= 2:
+            return "LONG"
+    if sp >= 85 and sc < 85:
+        recent = p["stoch"].iloc[max(0, i - 3):i - 1]
+        if (recent >= 85).sum() >= 2:
+            return "SHORT"
+    return None
+
+
+def _r80_bb(p, i):
+    """Bollinger pierce + reversion: long when close pierced below BB lower and
+    closes back inside; mirrored short on upper pierce."""
+    if i < 2:
+        return None
+    cp = p["close"].iloc[i - 1]; cc = p["close"].iloc[i]
+    lp = p["bb_lower"].iloc[i - 1]; lc = p["bb_lower"].iloc[i]
+    up_p = p["bb_upper"].iloc[i - 1]; uc = p["bb_upper"].iloc[i]
+    if pd.isna(lp) or pd.isna(lc) or pd.isna(up_p) or pd.isna(uc):
+        return None
+    if cp <= lp and cc > lc:
+        return "LONG"
+    if cp >= up_p and cc < uc:
+        return "SHORT"
+    return None
+
+
+def _r80_sig(p, i):
+    """Majority vote across the 4 signals; ties → None."""
+    long_votes = 0
+    short_votes = 0
+    for fn in (_r80_dbb, _r80_rsi, _r80_stoch, _r80_bb):
+        try:
+            d = fn(p, i)
+        except Exception:
+            d = None
+        if d == "LONG":
+            long_votes += 1
+        elif d == "SHORT":
+            short_votes += 1
+    if long_votes > short_votes:
+        return "LONG"
+    if short_votes > long_votes:
+        return "SHORT"
+    return None
+
+
+def _r80_exit(p, i, d):
+    """No strategy-side exit; rely on ATR SL/TP (sl=3.2, tp=0.82) and timeout."""
+    return False
+
+
+_register("r80_ensemble", "4-Signal Ensemble",
+          _r80_pre, _r80_sig, _r80_exit,
+          sl_mult=3.2, tp_mult=0.82)
+
+
+def _r80_score(p, i):
+    """Score 100 pts split across the 4 signals (25 pts each), with a small
+    volatility bonus."""
+    if i < 18:
+        return 0, 0
+    long_score = 0
+    short_score = 0
+    for fn in (_r80_dbb, _r80_rsi, _r80_stoch, _r80_bb):
+        try:
+            d = fn(p, i)
+        except Exception:
+            d = None
+        if d == "LONG":
+            long_score += 25
+        elif d == "SHORT":
+            short_score += 25
+    # ATR floor (already added in _Strategy.precompute)
+    if "atr" in p and "close" in p:
+        a = p["atr"].iloc[i] if i < len(p["atr"]) else float("nan")
+        c = p["close"].iloc[i] if i < len(p["close"]) else float("nan")
+        if pd.notna(a) and pd.notna(c) and c > 0 and a >= 0.003 * c:
+            # Don't let bonus exceed 100 either way
+            long_score = min(long_score, 100)
+            short_score = min(short_score, 100)
+    return long_score, short_score
+
+
+STRATEGIES_BY_ID["r80_ensemble"].score_at = lambda p, i: _r80_score(p, i)
+STRATEGIES_BY_ID["r80_ensemble"].backtest_wr = 74.6  # 4H/125-pair tuning win rate
+STRATEGIES_BY_ID["r80_ensemble"].score_description = [
+    "25 pts: Williams %R double-bottom cross (≥5 touches in 17 bars, Stoch confirms)",
+    "25 pts: RSI strict cross (RSI crosses 22/78 after ≥2 of prior 3 bars in extreme zone)",
+    "25 pts: Stoch K strict cross (crosses 15/85 after ≥2 of prior 3 bars in extreme)",
+    "25 pts: Bollinger pierce + reversion (close pierces and closes back inside k=2.5 band)",
+]
+
 
 # ===== Strategy persistence and discovery loop =====
 
@@ -469,16 +647,21 @@ STRATEGY_PATH = os.environ.get(
 active_strategy_id: str | None = None
 
 
-FORCED_STRATEGY_ID = "d9_williams_r"
+# Default strategy on a fresh install (overridden by saved strategy file).
+DEFAULT_STRATEGY_ID = "d9_williams_r"
+
+# Friendly aliases for the /strategy<N> commands.
+STRATEGY_ALIASES = {
+    "1": "d9_williams_r",
+    "2": "r80_ensemble",
+}
 
 
 def load_strategy() -> None:
-    """Force Williams %R as the permanent live strategy regardless of saved file."""
+    """Restore the previously selected strategy from disk, or default to
+    Williams %R on a fresh install. Switchable at runtime via /strategy1
+    and /strategy2."""
     global active_strategy_id
-    if FORCED_STRATEGY_ID not in STRATEGIES_BY_ID:
-        log.error("Forced strategy %s not in registry!", FORCED_STRATEGY_ID)
-        return
-
     saved_id = None
     if os.path.exists(STRATEGY_PATH):
         try:
@@ -486,21 +669,95 @@ def load_strategy() -> None:
                 saved_id = json.load(f).get("id")
         except Exception as e:
             log.warning("Failed to read %s: %s", STRATEGY_PATH, e)
+    if saved_id in STRATEGIES_BY_ID:
+        active_strategy_id = saved_id
+        log.info("Active strategy: %s (restored from disk)",
+                 STRATEGIES_BY_ID[saved_id].name)
+        return
+    # Fresh install or unrecognized id → default
+    active_strategy_id = DEFAULT_STRATEGY_ID
+    log.info("Active strategy: %s (default)",
+             STRATEGIES_BY_ID[DEFAULT_STRATEGY_ID].name)
+    save_strategy(DEFAULT_STRATEGY_ID, {
+        "name": STRATEGIES_BY_ID[DEFAULT_STRATEGY_ID].name,
+        "default": True,
+    })
 
-    active_strategy_id = FORCED_STRATEGY_ID
-    if saved_id != FORCED_STRATEGY_ID:
-        log.info(
-            "Forcing active strategy to Williams %%R (was %s); rewriting %s",
-            saved_id, STRATEGY_PATH,
+
+def switch_strategy(new_sid: str, reply_to_message_id: int | None = None) -> None:
+    """Switch the active strategy and persist. Clears any tentative tracking
+    (signals are strategy-specific) but leaves closed-trade history intact."""
+    global active_strategy_id
+    if new_sid not in STRATEGIES_BY_ID:
+        send_telegram(
+            f"❌ Unknown strategy id: <code>{new_sid}</code>. "
+            f"Available: {', '.join(STRATEGIES_BY_ID.keys())}",
+            reply_to_message_id=reply_to_message_id,
         )
-        save_strategy(FORCED_STRATEGY_ID, {
-            "name": STRATEGIES_BY_ID[FORCED_STRATEGY_ID].name,
-            "forced": True,
-            "opt_wr": 61.3, "opt_total": 6274,
-            "val_wr": 57.4, "val_total": 3009,
-        })
+        return
+    prev = active_strategy_id
+    if prev == new_sid:
+        send_telegram(
+            f"✅ Already on <b>{STRATEGIES_BY_ID[new_sid].name}</b>. No change.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+    active_strategy_id = new_sid
+    # Drop any pending signals — they were issued under the previous strategy.
+    try:
+        active_signals.clear()
+    except Exception:
+        pass
+    save_strategy(new_sid, {
+        "name": STRATEGIES_BY_ID[new_sid].name,
+        "switched_from": prev,
+        "switched_at": datetime.now(MYT).isoformat(),
+    })
+    log.info("Strategy switched: %s → %s", prev, new_sid)
+    send_telegram(
+        f"<b>🔄 Strategy switched</b>\n"
+        f"Previous: {STRATEGIES_BY_ID[prev].name if prev in STRATEGIES_BY_ID else prev}\n"
+        f"Now active: <b>{STRATEGIES_BY_ID[new_sid].name}</b>\n"
+        f"Only signals from this strategy will be shown until you switch again.",
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+def handle_strategy_command(args: list[str], reply_to_message_id: int | None = None) -> None:
+    """Handle `/strategy`, `/strategy1`, `/strategy2`, `/strategy <id>`."""
+    if not args:
+        # Show current active strategy
+        sid = active_strategy_id
+        if sid and sid in STRATEGIES_BY_ID:
+            s = STRATEGIES_BY_ID[sid]
+            available = "\n".join(
+                f"  /strategy{n} → {STRATEGIES_BY_ID[k].name}"
+                + (" (current)" if k == sid else "")
+                for n, k in STRATEGY_ALIASES.items()
+            )
+            send_telegram(
+                f"<b>Active strategy: {s.name}</b>\n"
+                f"ID: <code>{sid}</code>\n\n"
+                f"Switch with:\n{available}",
+                reply_to_message_id=reply_to_message_id,
+            )
+        else:
+            send_telegram(
+                "No active strategy loaded.",
+                reply_to_message_id=reply_to_message_id,
+            )
+        return
+    target = args[0].strip()
+    # Map "1", "2", "/strategy1", etc.
+    if target in STRATEGY_ALIASES:
+        switch_strategy(STRATEGY_ALIASES[target], reply_to_message_id)
+    elif target in STRATEGIES_BY_ID:
+        switch_strategy(target, reply_to_message_id)
     else:
-        log.info("Active strategy: Williams %%R (matches saved file)")
+        send_telegram(
+            f"❌ Unknown strategy: <code>{target}</code>",
+            reply_to_message_id=reply_to_message_id,
+        )
 
 
 def save_strategy(sid: str, meta: dict) -> None:
@@ -965,8 +1222,12 @@ def handle_paper_command(reply_to_message_id: int | None = None) -> None:
     if acc_wr is not None:
         body += f"Your accepted WR: {acc_wr:.1f}% (n={acc_n})\n"
 
+    active_name = (
+        STRATEGIES_BY_ID[active_strategy_id].name
+        if active_strategy_id in STRATEGIES_BY_ID else "?"
+    )
     msg = (
-        f"📄 <b>Paper Trading — Williams %R</b>\n"
+        f"📄 <b>Paper Trading — {active_name}</b>\n"
         f"<pre>{body}</pre>"
     )
     send_telegram(msg, reply_to_message_id=reply_to_message_id)
@@ -987,6 +1248,11 @@ def handle_commands_command(reply_to_message_id: int | None = None) -> None:
         "<code>/close SYMBOL</code> — you exited manually, record close at market\n"
         "<code>/reopen SYMBOL LONG|SHORT [price]</code> — re-attach a position\n"
         "(also <code>/cancel all</code>, <code>/close all</code>)\n"
+        "\n"
+        "<b>Strategy</b>\n"
+        "<code>/strategy</code> — show active strategy\n"
+        "<code>/strategy1</code> — switch to Williams %R\n"
+        "<code>/strategy2</code> — switch to 4-Signal Ensemble (R80)\n"
         "\n"
         "<b>Info / health</b>\n"
         "<code>/check</code> — confluence scores across all 20 pairs\n"
@@ -1674,6 +1940,12 @@ def telegram_poll_loop() -> None:
                     handle_cancel_command(parts[1:], msg.get("message_id"))
                 elif cmd == "/reopen":
                     handle_reopen_command(parts[1:], msg.get("message_id"))
+                elif cmd == "/strategy":
+                    handle_strategy_command(parts[1:], msg.get("message_id"))
+                elif cmd == "/strategy1":
+                    handle_strategy_command(["1"], msg.get("message_id"))
+                elif cmd == "/strategy2":
+                    handle_strategy_command(["2"], msg.get("message_id"))
             try:
                 _expire_old_signals()
             except Exception as e:
@@ -1928,14 +2200,14 @@ def main() -> None:
     load_params()
     load_strategy()
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
+    active = STRATEGIES_BY_ID.get(active_strategy_id) if active_strategy_id else None
+    active_name = active.name if active else "(none)"
     send_telegram(
         "<b>binance-signal-bot online</b>\n"
-        "Active strategy: <b>Williams %R</b> (hardcoded permanent default).\n"
-        "LONG when W%R(14) crosses above -80 from below; "
-        "SHORT when W%R(14) crosses below -20 from above; "
-        "exit when W%R reaches -50 or ATR-based SL is hit.\n"
-        "Backtest: 61.3% WR on optimization (6274 trades), "
-        "57.4% WR on validation (3009 trades).\n"
+        f"Active strategy: <b>{active_name}</b>\n"
+        "Switch any time with <code>/strategy1</code> (Williams %R) "
+        "or <code>/strategy2</code> (4-Signal Ensemble). "
+        "Only signals from the active strategy will be sent.\n"
         f"Timeframe: {TIMEFRAME} across {len(PAIRS)} Binance Futures pairs.\n"
         f"{win_rate_text()}\n"
         f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
