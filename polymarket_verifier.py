@@ -39,7 +39,7 @@ log = logging.getLogger("polyverify")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get(
     "POLYVERIFY_MODEL",
-    "claude-sonnet-4-6",  # Sonnet 4.6 — current Sonnet alias, much cheaper than Opus for 500 calls
+    "claude-opus-4-5",  # Opus 4.5 for superforecasting-grade calibration on probability estimates
 )
 PROGRESS_PATH = (
     "/data/polyverify_progress.json"
@@ -277,7 +277,7 @@ def estimate_probability(
     try:
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=500,
+            max_tokens=1000,
             system=SYSTEM_PROMPT,
             tools=[{"type": "web_search_20260209", "name": "web_search"}],
             messages=[{"role": "user", "content": user_prompt}],
