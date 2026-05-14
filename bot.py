@@ -2592,6 +2592,18 @@ def telegram_poll_loop() -> None:
                         target=lambda: r80_maybe_rebalance(force=True),
                         daemon=True,
                     ).start()
+                elif cmd in ("/polyverify", "/polyverify_fast"):
+                    try:
+                        import polymarket_verifier as polyv
+                        ack = polyv.kickoff_verifier_async(
+                            send_telegram,
+                            fast=(cmd == "/polyverify_fast"),
+                        )
+                    except ImportError as e:
+                        ack = f"❌ polymarket_verifier import failed: {e}"
+                    except Exception as e:
+                        ack = f"❌ /polyverify error: {e}"
+                    send_telegram(ack, reply_to_message_id=msg.get("message_id"))
             try:
                 _expire_old_signals()
             except Exception as e:
