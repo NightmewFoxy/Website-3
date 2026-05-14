@@ -489,8 +489,12 @@ def _bbands_indicator(close: pd.Series, period: int = 20, k: float = 2.5):
 
 def _r80_pre(df):
     upper, _, lower = _bbands_indicator(df["close"], 20, 2.5)
+    # R80 backtest used Wilder ATR with period 21, not the default 14. Provide
+    # "atr" explicitly here so _Strategy.precompute() does not fall back to
+    # atr(...,14).
     return {
         "open": df["open"], "high": df["high"], "low": df["low"], "close": df["close"],
+        "atr": atr(df["high"], df["low"], df["close"], 21),
         "wr": compute_williams_r(df["high"], df["low"], df["close"], 14),
         "rsi": _rsi_indicator(df["close"], 14),
         "stoch": _stoch_k_indicator(df["high"], df["low"], df["close"], 14),
@@ -574,22 +578,22 @@ def _r80_bb(p, i):
 
 
 def _r80_sig(p, i):
-    """Majority vote across the 4 signals; ties → None."""
-    long_votes = 0
-    short_votes = 0
+    """OR'd union in priority order: iterate the 4 signals in DBB > RSI >
+    Stoch > BB order and return the first non-None direction. This matches
+    the R80 backtest's `for sig in sigs: sym_trades.extend(...)` loop, which
+    after stable sort + dedupe-by-(sym, entry_time) deterministically keeps
+    the earliest-listed signal when multiple fire on the same bar.
+
+    NOTE: this is intentionally not a majority vote. R82 verified that
+    requiring vote >= 2 (or ties → None) shrinks the trade set so much that
+    compounded returns drop ~17× vs the OR'd version."""
     for fn in (_r80_dbb, _r80_rsi, _r80_stoch, _r80_bb):
         try:
             d = fn(p, i)
         except Exception:
             d = None
-        if d == "LONG":
-            long_votes += 1
-        elif d == "SHORT":
-            short_votes += 1
-    if long_votes > short_votes:
-        return "LONG"
-    if short_votes > long_votes:
-        return "SHORT"
+        if d is not None:
+            return d
     return None
 
 
