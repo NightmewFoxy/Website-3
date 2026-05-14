@@ -638,6 +638,492 @@ STRATEGIES_BY_ID["r80_ensemble"].score_description = [
 ]
 
 
+# ===== R80 portfolio simulator (active when /strategy2 is selected) =====
+# When the user is on strategy 2, the bot stops being a signal-alerter and
+# becomes a full portfolio simulator that mirrors the R80 walk-forward
+# champion exactly: 125-pair universe on 4H candles, weekly rolling top-15
+# pair selection, 2 concurrent positions at 10x leverage with compounding,
+# 70% drawdown circuit breaker. Telegram messages report each open/close
+# automatically; no "I'm In/Skip" prompts.
+
+R80_PAIRS_UNIVERSE = [
+    '1INCHUSDT', 'AAVEUSDT', 'ADAUSDT', 'AEVOUSDT', 'ALGOUSDT', 'ALTUSDT',
+    'ANKRUSDT', 'APEUSDT', 'APTUSDT', 'ARBUSDT', 'ARKUSDT', 'AVAUSDT',
+    'AVAXUSDT', 'BAKEUSDT', 'BANDUSDT', 'BCHUSDT', 'BELUSDT', 'BIGTIMEUSDT',
+    'BMTUSDT', 'BNBUSDT', 'BTCUSDT', 'CATIUSDT', 'CFXUSDT', 'CGPTUSDT',
+    'CHZUSDT', 'CKBUSDT', 'COMPUSDT', 'COSUSDT', 'COTIUSDT', 'CRVUSDT',
+    'CTKUSDT', 'CTSIUSDT', 'DGBUSDT', 'DOGEUSDT', 'DOTUSDT', 'ENJUSDT',
+    'ETCUSDT', 'ETHFIUSDT', 'ETHUSDT', 'FDUSDUSDT', 'FLMUSDT', 'FLOWUSDT',
+    'GALAUSDT', 'GHSTUSDT', 'GMTUSDT', 'GMXUSDT', 'GRTUSDT', 'GUSDT',
+    'HBARUSDT', 'HIVEUSDT', 'HMSTRUSDT', 'HOOKUSDT', 'HOTUSDT', 'IDUSDT',
+    'ILVUSDT', 'IMXUSDT', 'INJUSDT', 'JOEUSDT', 'KNCUSDT', 'LDOUSDT',
+    'LINKUSDT', 'LPTUSDT', 'LTCUSDT', 'MAGICUSDT', 'MASKUSDT', 'MAVUSDT',
+    'MEMEUSDT', 'METISUSDT', 'MKRUSDT', 'MOVRUSDT', 'NEARUSDT', 'NMRUSDT',
+    'NOTUSDT', 'OGNUSDT', 'OMNIUSDT', 'OMUSDT', 'ONEUSDT', 'ONGUSDT',
+    'OXTUSDT', 'PEOPLEUSDT', 'PERPUSDT', 'PONDUSDT', 'PORTALUSDT',
+    'POWRUSDT', 'PUNDIXUSDT', 'PYTHUSDT', 'QTUMUSDT', 'RAREUSDT',
+    'RENDERUSDT', 'RLCUSDT', 'RPLUSDT', 'RUNEUSDT', 'RVNUSDT', 'SANDUSDT',
+    'SEIUSDT', 'SFPUSDT', 'SHIBUSDT', 'SKLUSDT', 'SNXUSDT', 'SOLUSDT',
+    'SPELLUSDT', 'SSVUSDT', 'STEEMUSDT', 'STRKUSDT', 'SUIUSDT', 'SUNUSDT',
+    'SUSHIUSDT', 'TLMUSDT', 'TRBUSDT', 'TRXUSDT', 'TURBOUSDT', 'TUSDUSDT',
+    'UMAUSDT', 'UNIUSDT', 'USDPUSDT', 'USUALUSDT', 'VETUSDT', 'WANUSDT',
+    'WBTCUSDT', 'XECUSDT', 'XRPUSDT', 'XTZUSDT', 'YFIUSDT', 'ZILUSDT',
+    'ZRXUSDT',
+]
+
+R80_TIMEFRAME = "4h"
+R80_BAR_SECONDS = 4 * 3600
+R80_ATR_PERIOD = 21
+R80_SL_MULT = 3.2
+R80_TP_MULT = 0.82
+R80_MAX_HOLD_BARS = 20
+R80_COOLDOWN_BARS = 10
+R80_TOP_N = 15
+R80_N_SLOTS = 2
+R80_LEVERAGE = 10
+R80_FEE_PER_SIDE = 0.0005
+R80_LOOKBACK_DAYS = 7
+R80_REBALANCE_DAYS = 7
+R80_DD_CIRCUIT = 0.70
+R80_STARTING_BALANCE = 100.0
+
+R80_STATE_PATH = os.environ.get(
+    "R80_STATE_PATH",
+    "/data/r80_portfolio.json" if os.path.isdir("/data") else "r80_portfolio.json",
+)
+r80_state_lock = threading.Lock()
+r80_state: dict = {
+    "started_at": None,
+    "balance": R80_STARTING_BALANCE,
+    "peak": R80_STARTING_BALANCE,
+    "halted": False,
+    "positions": [None, None],
+    "cooldown_until": {},
+    "last_rebalance": None,
+    "top_pairs": [],
+    "closed_trades": [],
+    "last_eval_bar": {},
+    "stats": {
+        "total_signals_fired": 0, "total_trades_opened": 0,
+        "total_trades_closed": 0, "total_wins": 0, "total_losses": 0,
+        "total_liquidations": 0, "total_dd_halts": 0, "total_dd_resumes": 0,
+    },
+}
+
+
+def r80_load_state() -> None:
+    try:
+        if os.path.exists(R80_STATE_PATH):
+            with open(R80_STATE_PATH) as f:
+                loaded = json.load(f)
+            for k, v in loaded.items():
+                r80_state[k] = v
+            log.info("R80 state loaded: balance=$%.2f peak=$%.2f open=%d",
+                     r80_state["balance"], r80_state["peak"],
+                     sum(1 for p in r80_state["positions"] if p))
+        else:
+            r80_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    except Exception as e:
+        log.exception("R80 load_state failed: %s", e)
+
+
+def r80_save_state() -> None:
+    try:
+        parent = os.path.dirname(R80_STATE_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = R80_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(r80_state, f, default=str, indent=2)
+        os.replace(tmp, R80_STATE_PATH)
+    except Exception as e:
+        log.exception("R80 save_state failed: %s", e)
+
+
+def r80_reset_state() -> None:
+    """Wipe R80 portfolio state back to a fresh $100 from now."""
+    with r80_state_lock:
+        r80_state["balance"] = R80_STARTING_BALANCE
+        r80_state["peak"] = R80_STARTING_BALANCE
+        r80_state["halted"] = False
+        r80_state["positions"] = [None] * R80_N_SLOTS
+        r80_state["cooldown_until"] = {}
+        r80_state["last_rebalance"] = None
+        r80_state["top_pairs"] = []
+        r80_state["closed_trades"] = []
+        r80_state["last_eval_bar"] = {}
+        r80_state["stats"] = {
+            "total_signals_fired": 0, "total_trades_opened": 0,
+            "total_trades_closed": 0, "total_wins": 0, "total_losses": 0,
+            "total_liquidations": 0, "total_dd_halts": 0, "total_dd_resumes": 0,
+        }
+        r80_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    r80_save_state()
+
+
+def r80_backtest_pair(p, df, start_idx=0) -> list[dict]:
+    """Simulate the strategy over `df`, used purely to score pairs for ranking."""
+    trades = []
+    n = len(df)
+    i = max(start_idx, 25)
+    last_loss_end = None
+    while i < n - 1:
+        atr_v = p["atr"].iloc[i]
+        if pd.isna(atr_v):
+            i += 1; continue
+        if last_loss_end is not None and i < last_loss_end + R80_COOLDOWN_BARS:
+            i += 1; continue
+        d = _r80_sig(p, i)
+        if d is None:
+            i += 1; continue
+        entry = float(p["close"].iloc[i])
+        sl_d = R80_SL_MULT * atr_v; tp_d = R80_TP_MULT * atr_v
+        if d == "LONG":
+            sl, tp = entry - sl_d, entry + tp_d
+        else:
+            sl, tp = entry + sl_d, entry - tp_d
+        exit_i = None; result = None
+        for j in range(i + 1, min(i + 1 + R80_MAX_HOLD_BARS, n)):
+            hh = float(df["high"].iloc[j]); ll = float(df["low"].iloc[j])
+            if d == "LONG":
+                if ll <= sl: exit_i, result = j, "SL"; break
+                if hh >= tp: exit_i, result = j, "TP"; break
+            else:
+                if hh >= sl: exit_i, result = j, "SL"; break
+                if ll <= tp: exit_i, result = j, "TP"; break
+        if exit_i is None:
+            exit_i = min(i + R80_MAX_HOLD_BARS, n - 1); result = "TIMEOUT"
+        exit_px = float(p["close"].iloc[exit_i])
+        pnl_pct = (exit_px - entry) / entry if d == "LONG" else (entry - exit_px) / entry
+        trades.append({
+            "pnl_pct": pnl_pct,
+            "entry_time": df["open_time"].iloc[i].isoformat(),
+            "exit_time": df["open_time"].iloc[exit_i].isoformat(),
+        })
+        last_loss_end = exit_i if pnl_pct < 0 else None
+        i = exit_i + 1
+    return trades
+
+
+def r80_select_top_pairs() -> list[str]:
+    """Fetch all 125 pairs, simulate trades over the prior R80_LOOKBACK_DAYS,
+    rank by cumulative raw PnL %, return the top R80_TOP_N."""
+    log.info("R80: rebalancing top-%d from %d-pair universe", R80_TOP_N, len(R80_PAIRS_UNIVERSE))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=R80_LOOKBACK_DAYS)
+    scores: list[tuple[str, float]] = []
+    for sym in R80_PAIRS_UNIVERSE:
+        try:
+            df = fetch_klines(sym, interval=R80_TIMEFRAME, limit=300)
+        except Exception:
+            continue
+        if df is None or len(df) < 50:
+            continue
+        try:
+            strat = STRATEGIES_BY_ID["r80_ensemble"]
+            p = strat.precompute(df)
+            trades = r80_backtest_pair(p, df)
+            recent = [t for t in trades if pd.to_datetime(t["entry_time"]) >= cutoff]
+            scores.append((sym, sum(t["pnl_pct"] for t in recent)))
+        except Exception as e:
+            log.warning("R80 rank failed for %s: %s", sym, e)
+        time.sleep(0.05)
+    scores.sort(key=lambda kv: -kv[1])
+    return [s for s, _ in scores[:R80_TOP_N]]
+
+
+def r80_maybe_rebalance(force: bool = False) -> None:
+    now = datetime.now(timezone.utc)
+    last = r80_state.get("last_rebalance")
+    if not force and last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if (now - last_dt).total_seconds() < R80_REBALANCE_DAYS * 86400:
+                return
+        except Exception:
+            pass
+    new_top = r80_select_top_pairs()
+    if not new_top:
+        log.warning("R80 rebalance produced empty list; keeping prior")
+        return
+    with r80_state_lock:
+        prev = set(r80_state.get("top_pairs", []))
+        cur = set(new_top)
+        added = cur - prev; removed = prev - cur
+        r80_state["top_pairs"] = new_top
+        r80_state["last_rebalance"] = now.isoformat()
+    r80_save_state()
+    send_telegram(
+        f"<b>📊 /strategy2 — weekly pair rebalance</b>\n"
+        f"New top-{R80_TOP_N}: {', '.join(new_top)}\n"
+        f"➕ Added: {', '.join(sorted(added)) or 'none'}\n"
+        f"➖ Dropped: {', '.join(sorted(removed)) or 'none'}"
+    )
+
+
+def r80_free_slot() -> int | None:
+    for i, p in enumerate(r80_state["positions"]):
+        if p is None:
+            return i
+    return None
+
+
+def r80_open_position(sym: str, direction: str, entry_price: float,
+                      atr_v: float, entry_bar_time, slot_idx: int) -> None:
+    margin = r80_state["balance"] / R80_N_SLOTS
+    if margin < 1.0:
+        return
+    sl_d = R80_SL_MULT * atr_v; tp_d = R80_TP_MULT * atr_v
+    if direction == "LONG":
+        sl, tp = entry_price - sl_d, entry_price + tp_d
+    else:
+        sl, tp = entry_price + sl_d, entry_price - tp_d
+    entry_iso = (entry_bar_time if isinstance(entry_bar_time, str)
+                 else pd.Timestamp(entry_bar_time).isoformat())
+    max_hold_until = (pd.Timestamp(entry_bar_time) +
+                      timedelta(seconds=R80_MAX_HOLD_BARS * R80_BAR_SECONDS)).isoformat()
+    pos = {
+        "sym": sym, "dir": direction,
+        "entry_price": entry_price, "entry_time": entry_iso,
+        "sl": sl, "tp": tp, "max_hold_until": max_hold_until,
+        "margin": margin, "atr": atr_v,
+    }
+    with r80_state_lock:
+        r80_state["positions"][slot_idx] = pos
+        r80_state["stats"]["total_trades_opened"] += 1
+    r80_save_state()
+    send_telegram(
+        f"<b>🟢 /strategy2 OPEN {direction} {sym}</b>  (slot {slot_idx+1}/{R80_N_SLOTS})\n"
+        f"Entry: {_fmt_price(entry_price)}\n"
+        f"SL: {_fmt_price(sl)}  TP: {_fmt_price(tp)}\n"
+        f"Margin: ${margin:.2f} × {R80_LEVERAGE}x = "
+        f"${margin*R80_LEVERAGE:.2f} notional\n"
+        f"Balance: ${r80_state['balance']:.2f}"
+    )
+
+
+def r80_close_position(slot_idx: int, exit_price: float,
+                       exit_time_iso: str, reason: str) -> None:
+    pos = r80_state["positions"][slot_idx]
+    if pos is None:
+        return
+    direction = pos["dir"]; entry = pos["entry_price"]; margin = pos["margin"]
+    if direction == "LONG":
+        pnl_pct = (exit_price - entry) / entry
+    else:
+        pnl_pct = (entry - exit_price) / entry
+    pnl_pct_net = pnl_pct - 2 * R80_FEE_PER_SIDE
+    pnl_frac = pnl_pct_net * R80_LEVERAGE
+    liquidated = pnl_frac <= -1.0
+    if liquidated:
+        pnl_frac = -1.0
+    pnl_usd = margin * pnl_frac
+    with r80_state_lock:
+        r80_state["balance"] += pnl_usd
+        if r80_state["balance"] > r80_state["peak"]:
+            r80_state["peak"] = r80_state["balance"]
+        r80_state["positions"][slot_idx] = None
+        if pnl_usd < 0:
+            cd_until = (pd.Timestamp(exit_time_iso) +
+                        timedelta(seconds=R80_COOLDOWN_BARS * R80_BAR_SECONDS)).isoformat()
+            r80_state["cooldown_until"][pos["sym"]] = cd_until
+        r80_state["closed_trades"].append({
+            "sym": pos["sym"], "dir": direction,
+            "entry": entry, "exit": exit_price,
+            "pnl_pct": pnl_pct, "pnl_usd": pnl_usd,
+            "balance_after": r80_state["balance"],
+            "entry_time": pos["entry_time"], "exit_time": exit_time_iso,
+            "reason": reason, "margin": margin, "liquidated": liquidated,
+        })
+        r80_state["stats"]["total_trades_closed"] += 1
+        if pnl_usd > 0:
+            r80_state["stats"]["total_wins"] += 1
+        else:
+            r80_state["stats"]["total_losses"] += 1
+        if liquidated:
+            r80_state["stats"]["total_liquidations"] += 1
+        if (not r80_state["halted"]
+                and r80_state["balance"] < (1 - R80_DD_CIRCUIT) * r80_state["peak"]):
+            r80_state["halted"] = True
+            r80_state["stats"]["total_dd_halts"] += 1
+    r80_save_state()
+    emoji = "✅" if pnl_usd > 0 else ("💀" if liquidated else "❌")
+    halted_msg = ("\n<b>⛔ DD CIRCUIT TRIGGERED — TRADING PAUSED</b>"
+                  if r80_state["halted"] else "")
+    send_telegram(
+        f"<b>{emoji} /strategy2 CLOSE {direction} {pos['sym']} ({reason})</b>\n"
+        f"{_fmt_price(entry)} → {_fmt_price(exit_price)} ({pnl_pct*100:+.2f}%)\n"
+        f"Net after fees: {pnl_pct_net*100:+.2f}%\n"
+        f"Margin: ${margin:.2f} × {R80_LEVERAGE}x → P&L: <b>${pnl_usd:+.2f}</b>"
+        f"{' (LIQUIDATED)' if liquidated else ''}\n"
+        f"Balance: <b>${r80_state['balance']:.2f}</b>  Peak: ${r80_state['peak']:.2f}"
+        f"{halted_msg}"
+    )
+
+
+def r80_check_exits(now_utc: datetime) -> None:
+    for slot_idx, pos in enumerate(r80_state["positions"]):
+        if pos is None:
+            continue
+        try:
+            df = fetch_klines(pos["sym"], interval=R80_TIMEFRAME, limit=40)
+        except Exception as e:
+            log.warning("R80 fetch for exit-check %s failed: %s", pos["sym"], e)
+            continue
+        if df is None or len(df) < 2:
+            continue
+        entry_dt = pd.to_datetime(pos["entry_time"])
+        max_hold_dt = pd.to_datetime(pos["max_hold_until"])
+        sl = pos["sl"]; tp = pos["tp"]; direction = pos["dir"]
+        exit_price = None; exit_time_iso = None; reason = None
+        for k in range(len(df)):
+            bar_open = df["open_time"].iloc[k]
+            if bar_open <= entry_dt:
+                continue
+            bar_close_time = df["close_time"].iloc[k]
+            if bar_close_time > pd.Timestamp(now_utc):
+                continue
+            hh = float(df["high"].iloc[k]); ll = float(df["low"].iloc[k])
+            close_px = float(df["close"].iloc[k])
+            if direction == "LONG":
+                if ll <= sl:
+                    exit_price, reason = sl, "SL"; exit_time_iso = bar_open.isoformat(); break
+                if hh >= tp:
+                    exit_price, reason = tp, "TP"; exit_time_iso = bar_open.isoformat(); break
+            else:
+                if hh >= sl:
+                    exit_price, reason = sl, "SL"; exit_time_iso = bar_open.isoformat(); break
+                if ll <= tp:
+                    exit_price, reason = tp, "TP"; exit_time_iso = bar_open.isoformat(); break
+            if bar_open >= max_hold_dt:
+                exit_price = close_px; reason = "TIMEOUT"
+                exit_time_iso = bar_open.isoformat()
+                break
+        if exit_price is not None:
+            r80_close_position(slot_idx, exit_price, exit_time_iso, reason)
+
+
+def r80_check_dd_resume() -> None:
+    if not r80_state["halted"]:
+        return
+    if r80_state["balance"] >= r80_state["peak"]:
+        with r80_state_lock:
+            r80_state["halted"] = False
+            r80_state["stats"]["total_dd_resumes"] += 1
+        r80_save_state()
+        send_telegram(
+            f"<b>🟢 /strategy2 DD CIRCUIT CLEARED — TRADING RESUMED</b>\n"
+            f"Balance: ${r80_state['balance']:.2f}  Peak: ${r80_state['peak']:.2f}"
+        )
+
+
+def r80_scan_entries(now_utc: datetime) -> None:
+    if r80_state["halted"]:
+        return
+    if r80_free_slot() is None:
+        return
+    top = r80_state.get("top_pairs", [])
+    if not top:
+        return
+    held_syms = {p["sym"] for p in r80_state["positions"] if p is not None}
+    cooldown = r80_state.get("cooldown_until", {})
+    for sym in top:
+        if sym in held_syms:
+            continue
+        cd = cooldown.get(sym)
+        if cd:
+            try:
+                if datetime.now(timezone.utc) < datetime.fromisoformat(cd):
+                    continue
+            except Exception:
+                pass
+        try:
+            df = fetch_klines(sym, interval=R80_TIMEFRAME, limit=300)
+        except Exception:
+            continue
+        if df is None or len(df) < 50:
+            continue
+        last_close = df["close_time"].iloc[-1]
+        idx = len(df) - 2 if last_close > pd.Timestamp(now_utc) else len(df) - 1
+        if idx < 30:
+            continue
+        bar_iso = df["open_time"].iloc[idx].isoformat()
+        if r80_state["last_eval_bar"].get(sym) == bar_iso:
+            continue
+        r80_state["last_eval_bar"][sym] = bar_iso
+        try:
+            strat = STRATEGIES_BY_ID["r80_ensemble"]
+            p = strat.precompute(df)
+            direction = _r80_sig(p, idx)
+        except Exception as e:
+            log.warning("R80 eval %s failed: %s", sym, e)
+            continue
+        if direction is None:
+            continue
+        atr_v = float(p["atr"].iloc[idx])
+        if not (atr_v > 0):
+            continue
+        entry_price = float(p["close"].iloc[idx])
+        entry_bar_time = df["open_time"].iloc[idx]
+        r80_state["stats"]["total_signals_fired"] += 1
+        slot = r80_free_slot()
+        if slot is None:
+            return
+        r80_open_position(sym, direction, entry_price, atr_v, entry_bar_time, slot)
+        # Stop after opening one new position; loop again next scan
+        return
+
+
+def r80_scan_once() -> None:
+    """Full R80 portfolio scan: check exits → DD resume → rebalance → entries."""
+    now_utc = datetime.now(timezone.utc)
+    r80_check_exits(now_utc)
+    r80_check_dd_resume()
+    if not r80_state.get("top_pairs"):
+        r80_maybe_rebalance(force=True)
+    else:
+        r80_maybe_rebalance(force=False)
+    r80_scan_entries(now_utc)
+
+
+def r80_status_message() -> str:
+    s = r80_state
+    n_open = sum(1 for p in s["positions"] if p)
+    pnl = s["balance"] - R80_STARTING_BALANCE
+    ret_pct = (s["balance"] / R80_STARTING_BALANCE - 1) * 100
+    drawdown = (s["peak"] - s["balance"]) / s["peak"] * 100 if s["peak"] > 0 else 0
+    halt_str = "⛔ <b>HALTED (DD circuit)</b>" if s["halted"] else "🟢 active"
+    started = s.get("started_at", "?")
+    stats = s.get("stats", {})
+    pos_lines = []
+    for i, p in enumerate(s["positions"]):
+        if p:
+            pos_lines.append(
+                f"  Slot {i+1}: {p['dir']} {p['sym']} @ {_fmt_price(p['entry_price'])} "
+                f"(margin ${p['margin']:.2f})"
+            )
+    pos_str = "\n".join(pos_lines) if pos_lines else "  (no open positions)"
+    n_closed = stats.get("total_trades_closed", 0)
+    wins = stats.get("total_wins", 0)
+    wr = (100.0 * wins / n_closed) if n_closed else 0
+    return (
+        f"<b>/strategy2 portfolio</b>  [{halt_str}]\n"
+        f"Started: {started}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Balance:  <b>${s['balance']:.2f}</b>  ({ret_pct:+.2f}% from $100)\n"
+        f"Peak:     ${s['peak']:.2f}\n"
+        f"Drawdown: {drawdown:.1f}% from peak\n"
+        f"P&L:      ${pnl:+.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Open positions ({n_open}/{R80_N_SLOTS}):\n{pos_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Closed: {n_closed}  Wins: {wins}  WR: {wr:.1f}%  "
+        f"Liq: {stats.get('total_liquidations', 0)}\n"
+        f"DD halts: {stats.get('total_dd_halts', 0)}  "
+        f"resumes: {stats.get('total_dd_resumes', 0)}\n"
+        f"Last rebalance: {s.get('last_rebalance', 'never')}"
+    )
+
+
 # ===== Strategy persistence and discovery loop =====
 
 STRATEGY_PATH = os.environ.get(
@@ -714,13 +1200,27 @@ def switch_strategy(new_sid: str, reply_to_message_id: int | None = None) -> Non
         "switched_at": datetime.now(MYT).isoformat(),
     })
     log.info("Strategy switched: %s → %s", prev, new_sid)
-    send_telegram(
-        f"<b>🔄 Strategy switched</b>\n"
-        f"Previous: {STRATEGIES_BY_ID[prev].name if prev in STRATEGIES_BY_ID else prev}\n"
-        f"Now active: <b>{STRATEGIES_BY_ID[new_sid].name}</b>\n"
-        f"Only signals from this strategy will be shown until you switch again.",
-        reply_to_message_id=reply_to_message_id,
-    )
+    if new_sid == "r80_ensemble":
+        send_telegram(
+            f"<b>🔄 Switched to {STRATEGIES_BY_ID[new_sid].name}</b>\n"
+            f"The bot is now running the R80 portfolio simulator:\n"
+            f"• 125 USDT-perp pairs, 4H candles\n"
+            f"• Rolling top-{R80_TOP_N} pairs (rebalanced every {R80_REBALANCE_DAYS}d)\n"
+            f"• {R80_N_SLOTS} concurrent positions at {R80_LEVERAGE}x leverage, compounded\n"
+            f"• {int(R80_DD_CIRCUIT*100)}% drawdown circuit breaker\n"
+            f"• Balance: ${r80_state['balance']:.2f}  Peak: ${r80_state['peak']:.2f}\n"
+            f"Positions open/close automatically — no /accept needed.\n"
+            f"<code>/strategy2status</code> for live status.",
+            reply_to_message_id=reply_to_message_id,
+        )
+    else:
+        send_telegram(
+            f"<b>🔄 Strategy switched</b>\n"
+            f"Previous: {STRATEGIES_BY_ID[prev].name if prev in STRATEGIES_BY_ID else prev}\n"
+            f"Now active: <b>{STRATEGIES_BY_ID[new_sid].name}</b>\n"
+            f"Only signals from this strategy will be shown until you switch again.",
+            reply_to_message_id=reply_to_message_id,
+        )
 
 
 def handle_strategy_command(args: list[str], reply_to_message_id: int | None = None) -> None:
@@ -1113,9 +1613,12 @@ PAPER_FEE_PCT_ONE_SIDE = 0.0004  # Binance Futures taker 0.04% per side
 
 
 def handle_paper_command(reply_to_message_id: int | None = None) -> None:
-    """Show paper-trading stats assuming every closed trade was auto-executed
-    at fixed $100 notional with Binance taker fees."""
+    """Show paper-trading stats. On /strategy2 this is the live R80 portfolio
+    status; on /strategy1 it's the legacy fixed-$100 signal P&L."""
     log.info("Processing /paper command")
+    if active_strategy_id == "r80_ensemble":
+        send_telegram(r80_status_message(), reply_to_message_id=reply_to_message_id)
+        return
     if not closed_trades:
         send_telegram(
             "No closed trades yet. Paper P&L starts populating after the "
@@ -1251,8 +1754,13 @@ def handle_commands_command(reply_to_message_id: int | None = None) -> None:
         "\n"
         "<b>Strategy</b>\n"
         "<code>/strategy</code> — show active strategy\n"
-        "<code>/strategy1</code> — switch to Williams %R\n"
-        "<code>/strategy2</code> — switch to 4-Signal Ensemble (R80)\n"
+        "<code>/strategy1</code> — Williams %R (signal alerter)\n"
+        "<code>/strategy2</code> — R80 4-Signal Ensemble (full portfolio sim, "
+        "2 slots, 10x, compound, 70% DD circuit)\n"
+        "<code>/strategy2status</code> — R80 balance / open positions / stats\n"
+        "<code>/strategy2pairs</code> — current top-15 trading pairs\n"
+        "<code>/strategy2rebalance</code> — force a pair rebalance now\n"
+        "<code>/strategy2reset</code> — wipe R80 portfolio, restart from $100\n"
         "\n"
         "<b>Info / health</b>\n"
         "<code>/check</code> — confluence scores across all 20 pairs\n"
@@ -1946,6 +2454,31 @@ def telegram_poll_loop() -> None:
                     handle_strategy_command(["1"], msg.get("message_id"))
                 elif cmd == "/strategy2":
                     handle_strategy_command(["2"], msg.get("message_id"))
+                elif cmd == "/strategy2status":
+                    send_telegram(r80_status_message(), reply_to_message_id=msg.get("message_id"))
+                elif cmd == "/strategy2reset":
+                    r80_reset_state()
+                    send_telegram(
+                        f"<b>/strategy2 portfolio reset</b> — fresh "
+                        f"${R80_STARTING_BALANCE:.0f} from now.",
+                        reply_to_message_id=msg.get("message_id"),
+                    )
+                elif cmd == "/strategy2pairs":
+                    top = r80_state.get("top_pairs", [])
+                    send_telegram(
+                        "<b>/strategy2 current top-15:</b>\n" +
+                        ("\n".join(top) if top else "(no rebalance yet)"),
+                        reply_to_message_id=msg.get("message_id"),
+                    )
+                elif cmd == "/strategy2rebalance":
+                    send_telegram(
+                        "Forcing /strategy2 pair rebalance — may take 1-2 min...",
+                        reply_to_message_id=msg.get("message_id"),
+                    )
+                    threading.Thread(
+                        target=lambda: r80_maybe_rebalance(force=True),
+                        daemon=True,
+                    ).start()
             try:
                 _expire_old_signals()
             except Exception as e:
@@ -2199,23 +2732,40 @@ def main() -> None:
     load_state()
     load_params()
     load_strategy()
+    r80_load_state()
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
     active = STRATEGIES_BY_ID.get(active_strategy_id) if active_strategy_id else None
     active_name = active.name if active else "(none)"
-    send_telegram(
-        "<b>binance-signal-bot online</b>\n"
-        f"Active strategy: <b>{active_name}</b>\n"
-        "Switch any time with <code>/strategy1</code> (Williams %R) "
-        "or <code>/strategy2</code> (4-Signal Ensemble). "
-        "Only signals from the active strategy will be sent.\n"
-        f"Timeframe: {TIMEFRAME} across {len(PAIRS)} Binance Futures pairs.\n"
-        f"{win_rate_text()}\n"
-        f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
-    )
+    if active_strategy_id == "r80_ensemble":
+        send_telegram(
+            "<b>binance-signal-bot online — /strategy2 mode</b>\n"
+            "Running the R80 portfolio simulator: 4-Signal Ensemble on 4H "
+            f"candles across {len(R80_PAIRS_UNIVERSE)} USDT-perp pairs.\n"
+            f"Rolling top-{R80_TOP_N} weekly rebalance, "
+            f"{R80_N_SLOTS} concurrent positions at {R80_LEVERAGE}x leverage, "
+            f"compounded. {int(R80_DD_CIRCUIT*100)}% drawdown circuit breaker.\n"
+            f"Balance: ${r80_state['balance']:.2f}  Peak: ${r80_state['peak']:.2f}\n"
+            "Switch back with <code>/strategy1</code> for Williams %R signals.\n"
+            f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
+        )
+    else:
+        send_telegram(
+            "<b>binance-signal-bot online</b>\n"
+            f"Active strategy: <b>{active_name}</b>\n"
+            "Switch any time with <code>/strategy1</code> (Williams %R) "
+            "or <code>/strategy2</code> (4-Signal Ensemble portfolio sim). "
+            "Only signals from the active strategy will be sent.\n"
+            f"Timeframe: {TIMEFRAME} across {len(PAIRS)} Binance Futures pairs.\n"
+            f"{win_rate_text()}\n"
+            f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
+        )
     while True:
         start = time.time()
         try:
-            scan_once()
+            if active_strategy_id == "r80_ensemble":
+                r80_scan_once()
+            else:
+                scan_once()
         except Exception as e:
             log.exception("scan loop error: %s", e)
         try:
