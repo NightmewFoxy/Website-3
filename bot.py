@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+import live_trader
+
 BINANCE_FAPI = "https://fapi.binance.com"
 TELEGRAM_API = "https://api.telegram.org"
 
@@ -869,7 +871,17 @@ def r80_free_slot() -> int | None:
 
 def r80_open_position(sym: str, direction: str, entry_price: float,
                       atr_v: float, entry_bar_time, slot_idx: int) -> None:
-    margin = r80_state["balance"] / R80_N_SLOTS
+    # Source margin from live balance when trading for real, otherwise from
+    # the simulator's tracked balance.
+    if live_trader.is_live():
+        live_bal = live_trader.get_futures_balance()
+        if live_bal is not None and live_bal > 0:
+            margin = live_bal / R80_N_SLOTS
+        else:
+            log.warning("R80 live: could not read live balance, falling back to local")
+            margin = r80_state["balance"] / R80_N_SLOTS
+    else:
+        margin = r80_state["balance"] / R80_N_SLOTS
     if margin < 1.0:
         return
     sl_d = R80_SL_MULT * atr_v; tp_d = R80_TP_MULT * atr_v
@@ -881,18 +893,54 @@ def r80_open_position(sym: str, direction: str, entry_price: float,
                  else pd.Timestamp(entry_bar_time).isoformat())
     max_hold_until = (pd.Timestamp(entry_bar_time) +
                       timedelta(seconds=R80_MAX_HOLD_BARS * R80_BAR_SECONDS)).isoformat()
+
+    # Live execution path — hit the exchange and use the actual fill price.
+    live_info = None
+    if live_trader.is_live():
+        result = live_trader.execute_entry(
+            sym, direction, R80_LEVERAGE, margin, sl, tp, entry_price,
+        )
+        if not result or not result.get("ok"):
+            err = (result or {}).get("error", "unknown")
+            log.warning("R80 live entry %s rejected: %s", sym, err)
+            send_telegram(
+                f"<b>⚠️ /strategy2 LIVE ENTRY REJECTED — {sym} {direction}</b>\n"
+                f"Reason: {err}\n"
+                f"Skipping this signal."
+            )
+            return
+        # Re-derive SL/TP off the actual fill so they stay 3.2/0.82 × ATR
+        fill_price = result["fill_price"]
+        if direction == "LONG":
+            sl = fill_price - sl_d; tp = fill_price + tp_d
+        else:
+            sl = fill_price + sl_d; tp = fill_price - tp_d
+        entry_price = fill_price
+        live_info = {
+            "live": True,
+            "quantity": result["quantity"],
+            "order_id": result["order_id"],
+            "sl_order_id": result["sl_order_id"],
+            "tp_order_id": result["tp_order_id"],
+            "entry_time_ms": int(time.time() * 1000),
+        }
+
     pos = {
         "sym": sym, "dir": direction,
         "entry_price": entry_price, "entry_time": entry_iso,
         "sl": sl, "tp": tp, "max_hold_until": max_hold_until,
         "margin": margin, "atr": atr_v,
     }
+    if live_info:
+        pos.update(live_info)
     with r80_state_lock:
         r80_state["positions"][slot_idx] = pos
         r80_state["stats"]["total_trades_opened"] += 1
     r80_save_state()
+    live_tag = " <i>(LIVE)</i>" if live_info else ""
     send_telegram(
-        f"<b>🟢 /strategy2 OPEN {direction} {sym}</b>  (slot {slot_idx+1}/{R80_N_SLOTS})\n"
+        f"<b>🟢 /strategy2 OPEN {direction} {sym}{live_tag}</b>  "
+        f"(slot {slot_idx+1}/{R80_N_SLOTS})\n"
         f"Entry: {_fmt_price(entry_price)}\n"
         f"SL: {_fmt_price(sl)}  TP: {_fmt_price(tp)}\n"
         f"Margin: ${margin:.2f} × {R80_LEVERAGE}x = "
@@ -902,7 +950,8 @@ def r80_open_position(sym: str, direction: str, entry_price: float,
 
 
 def r80_close_position(slot_idx: int, exit_price: float,
-                       exit_time_iso: str, reason: str) -> None:
+                       exit_time_iso: str, reason: str,
+                       realized_pnl: float | None = None) -> None:
     pos = r80_state["positions"][slot_idx]
     if pos is None:
         return
@@ -916,7 +965,13 @@ def r80_close_position(slot_idx: int, exit_price: float,
     liquidated = pnl_frac <= -1.0
     if liquidated:
         pnl_frac = -1.0
-    pnl_usd = margin * pnl_frac
+    # If we have a real exchange-realized PnL, trust it over the simulated one.
+    # (It already accounts for actual slippage, fees, funding, etc.)
+    if realized_pnl is not None:
+        pnl_usd = float(realized_pnl)
+        liquidated = pnl_usd <= -margin * 0.99  # within 1% of full margin loss
+    else:
+        pnl_usd = margin * pnl_frac
     with r80_state_lock:
         r80_state["balance"] += pnl_usd
         if r80_state["balance"] > r80_state["peak"]:
@@ -964,16 +1019,58 @@ def r80_check_exits(now_utc: datetime) -> None:
     for slot_idx, pos in enumerate(r80_state["positions"]):
         if pos is None:
             continue
+        sym = pos["sym"]
+        direction = pos["dir"]
+        sl = pos["sl"]; tp = pos["tp"]
+        max_hold_dt = pd.to_datetime(pos["max_hold_until"])
+
+        # Live path: the exchange holds the real SL+TP. We just check whether
+        # the position is still open. If flat, reconcile the actual fill.
+        if pos.get("live") and live_trader.is_live():
+            entry_ms = int(pos.get("entry_time_ms", 0)) or None
+            recon = live_trader.reconcile_exit(sym, entry_ms or 0)
+            if recon and recon.get("closed"):
+                fill = recon.get("fill_price") or pos["entry_price"]
+                # Figure out which leg fired by comparing to SL/TP
+                if direction == "LONG":
+                    reason = "SL" if fill <= sl * 1.001 else (
+                        "TP" if fill >= tp * 0.999 else "EXIT")
+                else:
+                    reason = "SL" if fill >= sl * 0.999 else (
+                        "TP" if fill <= tp * 1.001 else "EXIT")
+                r80_close_position(slot_idx, fill,
+                                   pd.Timestamp(now_utc).isoformat(),
+                                   reason, realized_pnl=recon.get("realized_pnl"))
+                continue
+            # Still open: enforce max_hold timeout
+            if pd.Timestamp(now_utc) >= max_hold_dt:
+                qty = pos.get("quantity", 0)
+                if qty:
+                    close = live_trader.execute_close(sym, direction, qty)
+                    if close and close.get("ok"):
+                        # Now reconcile to capture realized PnL
+                        time.sleep(1)
+                        recon = live_trader.reconcile_exit(sym, entry_ms or 0)
+                        fill = (recon and recon.get("fill_price")) or close.get("fill_price") or pos["entry_price"]
+                        r80_close_position(
+                            slot_idx, fill,
+                            pd.Timestamp(now_utc).isoformat(),
+                            "TIMEOUT",
+                            realized_pnl=(recon or {}).get("realized_pnl"),
+                        )
+                    else:
+                        log.warning("R80 live timeout-close %s failed: %s", sym, close)
+            continue
+
+        # Paper path: walk candles to detect SL/TP/timeout
         try:
-            df = fetch_klines(pos["sym"], interval=R80_TIMEFRAME, limit=40)
+            df = fetch_klines(sym, interval=R80_TIMEFRAME, limit=40)
         except Exception as e:
-            log.warning("R80 fetch for exit-check %s failed: %s", pos["sym"], e)
+            log.warning("R80 fetch for exit-check %s failed: %s", sym, e)
             continue
         if df is None or len(df) < 2:
             continue
         entry_dt = pd.to_datetime(pos["entry_time"])
-        max_hold_dt = pd.to_datetime(pos["max_hold_until"])
-        sl = pos["sl"]; tp = pos["tp"]; direction = pos["dir"]
         exit_price = None; exit_time_iso = None; reason = None
         for k in range(len(df)):
             bar_open = df["open_time"].iloc[k]
@@ -1092,6 +1189,11 @@ def r80_status_message() -> str:
     ret_pct = (s["balance"] / R80_STARTING_BALANCE - 1) * 100
     drawdown = (s["peak"] - s["balance"]) / s["peak"] * 100 if s["peak"] > 0 else 0
     halt_str = "⛔ <b>HALTED (DD circuit)</b>" if s["halted"] else "🟢 active"
+    if live_trader.is_live():
+        net = "TESTNET" if live_trader.TESTNET else "MAINNET"
+        halt_str += f"  ·  <b>LIVE ({net})</b>"
+    else:
+        halt_str += "  ·  paper"
     started = s.get("started_at", "?")
     stats = s.get("stats", {})
     pos_lines = []
@@ -2736,6 +2838,32 @@ def main() -> None:
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
     active = STRATEGIES_BY_ID.get(active_strategy_id) if active_strategy_id else None
     active_name = active.name if active else "(none)"
+
+    # Live trading validation (only when /strategy2 is active and env vars set)
+    live_mode_str = ""
+    if active_strategy_id == "r80_ensemble" and live_trader.is_live():
+        if live_trader.validate_api_key():
+            bal = live_trader.get_futures_balance()
+            net = "TESTNET" if live_trader.TESTNET else "MAINNET"
+            live_mode_str = (
+                f"\n<b>⚠️ LIVE TRADING ENABLED ({net})</b>\n"
+                f"Exchange USDT balance: ${bal:.2f}\n"
+                f"Real orders will be placed on signals. To stop new "
+                f"entries: <code>/strategy1</code>."
+            )
+            # Sync simulator balance/peak to exchange balance on first live run
+            if bal and bal > 0 and r80_state["balance"] == R80_STARTING_BALANCE:
+                with r80_state_lock:
+                    r80_state["balance"] = float(bal)
+                    r80_state["peak"] = float(bal)
+                r80_save_state()
+        else:
+            live_mode_str = (
+                "\n<b>❌ LIVE TRADING ENV VARS SET BUT API KEY INVALID</b>\n"
+                "Cannot read futures balance. Check BINANCE_API_KEY / "
+                "BINANCE_API_SECRET / permissions. Staying in PAPER mode."
+            )
+
     if active_strategy_id == "r80_ensemble":
         send_telegram(
             "<b>binance-signal-bot online — /strategy2 mode</b>\n"
@@ -2744,7 +2872,8 @@ def main() -> None:
             f"Rolling top-{R80_TOP_N} weekly rebalance, "
             f"{R80_N_SLOTS} concurrent positions at {R80_LEVERAGE}x leverage, "
             f"compounded. {int(R80_DD_CIRCUIT*100)}% drawdown circuit breaker.\n"
-            f"Balance: ${r80_state['balance']:.2f}  Peak: ${r80_state['peak']:.2f}\n"
+            f"Balance: ${r80_state['balance']:.2f}  Peak: ${r80_state['peak']:.2f}"
+            f"{live_mode_str}\n"
             "Switch back with <code>/strategy1</code> for Williams %R signals.\n"
             f"Started: {datetime.now(MYT).strftime('%Y-%m-%d %H:%M:%S MYT')}"
         )
