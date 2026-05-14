@@ -1030,6 +1030,8 @@ def r80_check_exits(now_utc: datetime) -> None:
 
         # Live path: the exchange holds the real SL+TP. We just check whether
         # the position is still open. If flat, reconcile the actual fill.
+        # We use net_pnl (realized_pnl − total fees on entry+exit fills) so
+        # the bot's tracked balance matches the exchange wallet balance.
         if pos.get("live") and live_trader.is_live():
             entry_ms = int(pos.get("entry_time_ms", 0)) or None
             recon = live_trader.reconcile_exit(sym, entry_ms or 0)
@@ -1042,9 +1044,12 @@ def r80_check_exits(now_utc: datetime) -> None:
                 else:
                     reason = "SL" if fill >= sl * 0.999 else (
                         "TP" if fill <= tp * 1.001 else "EXIT")
+                net = recon.get("net_pnl")
+                if net is None:
+                    net = recon.get("realized_pnl")
                 r80_close_position(slot_idx, fill,
                                    pd.Timestamp(now_utc).isoformat(),
-                                   reason, realized_pnl=recon.get("realized_pnl"))
+                                   reason, realized_pnl=net)
                 continue
             # Still open: enforce max_hold timeout
             if pd.Timestamp(now_utc) >= max_hold_dt:
@@ -1052,15 +1057,17 @@ def r80_check_exits(now_utc: datetime) -> None:
                 if qty:
                     close = live_trader.execute_close(sym, direction, qty)
                     if close and close.get("ok"):
-                        # Now reconcile to capture realized PnL
                         time.sleep(1)
                         recon = live_trader.reconcile_exit(sym, entry_ms or 0)
                         fill = (recon and recon.get("fill_price")) or close.get("fill_price") or pos["entry_price"]
+                        net = (recon or {}).get("net_pnl")
+                        if net is None:
+                            net = (recon or {}).get("realized_pnl")
                         r80_close_position(
                             slot_idx, fill,
                             pd.Timestamp(now_utc).isoformat(),
                             "TIMEOUT",
-                            realized_pnl=(recon or {}).get("realized_pnl"),
+                            realized_pnl=net,
                         )
                     else:
                         log.warning("R80 live timeout-close %s failed: %s", sym, close)

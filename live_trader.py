@@ -394,8 +394,16 @@ def execute_close(symbol: str, direction: str,
 
 
 def reconcile_exit(symbol: str, entry_time_ms: int) -> dict | None:
-    """If position is flat on the exchange, find the most recent closing fill
-    after entry_time_ms and return its price and realized PnL."""
+    """If position is flat on the exchange, find the closing fills since
+    entry_time_ms and return:
+      - fill_price: price of the most recent fill
+      - realized_pnl: GROSS pnl from price moves (sum of closing trades' realizedPnl)
+      - fee: TOTAL commission across entry + exit fills since entry_time_ms
+      - net_pnl: realized_pnl - fee  (the actual wallet-balance delta)
+
+    Note Binance's `realizedPnl` is gross of commission and only populated on
+    closing trades, so we sum fees over ALL fills since entry to capture
+    both the entry-side and exit-side commission."""
     if not is_live():
         return None
     pos = get_position(symbol)
@@ -409,23 +417,33 @@ def reconcile_exit(symbol: str, entry_time_ms: int) -> dict | None:
         return {"closed": False, "size": amt}
     trades = get_user_trades(symbol, since_ms=entry_time_ms, limit=50)
     if not trades:
-        return {"closed": True, "fill_price": None, "realized_pnl": None}
+        return {"closed": True, "fill_price": None, "realized_pnl": None,
+                "fee": 0.0, "net_pnl": None}
+    # Sum fees across ALL fills since entry — covers both entry and exit
+    fee_total = 0.0
+    for t in trades:
+        try:
+            fee_total += float(t.get("commission", 0))
+        except (TypeError, ValueError):
+            pass
     closing = [t for t in trades if t.get("realizedPnl") not in (None, "0")]
     if not closing:
-        # Last trade is probably the exit even if realizedPnl wasn't set;
-        # fall back to the most recent trade
         last = trades[-1]
         try:
-            return {"closed": True,
-                    "fill_price": float(last.get("price", 0)),
-                    "realized_pnl": float(last.get("realizedPnl", 0)),
-                    "fee": float(last.get("commission", 0))}
+            realized = float(last.get("realizedPnl", 0))
         except (TypeError, ValueError):
-            return {"closed": True, "fill_price": None, "realized_pnl": None}
+            realized = 0.0
+        try:
+            fill_px = float(last.get("price", 0))
+        except (TypeError, ValueError):
+            fill_px = None
+        return {"closed": True, "fill_price": fill_px,
+                "realized_pnl": realized, "fee": fee_total,
+                "net_pnl": realized - fee_total}
     realized = sum(float(t.get("realizedPnl", 0)) for t in closing)
-    fee = sum(float(t.get("commission", 0)) for t in closing)
     last_fill = float(closing[-1].get("price", 0))
     # Cancel any leftover (untriggered SL or TP)
     cancel_all_open_orders(symbol)
     return {"closed": True, "fill_price": last_fill,
-            "realized_pnl": realized, "fee": fee}
+            "realized_pnl": realized, "fee": fee_total,
+            "net_pnl": realized - fee_total}
